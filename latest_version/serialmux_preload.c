@@ -353,6 +353,22 @@ static int passthrough_ioctl(int fd, unsigned long request, void *argp) {
     return real_ioctl(fd, request, argp);
 }
 
+/* Open PTY with retry on ENOENT, for up to ~200ms */
+static int open_pty_with_retry(const char *pty_path, int flags, int need_mode, mode_t mode) {
+    int fd = -1;
+    for (int i = 0; i < 20; i++) {
+        fd = need_mode ? real_open(pty_path, flags, mode) : real_open(pty_path, flags);
+        if (fd >= 0) {
+            break;
+        }
+        if (errno != ENOENT) {
+            break;
+        }
+        usleep(10000);  // 10ms
+    }
+    return fd;
+}
+
 /* wrapper implementations */
 
 /* open */
@@ -375,8 +391,10 @@ int open(const char *path, int flags, ...) {
 
     char pty_path[256];
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
-        int fd = need_mode ? real_open(pty_path, flags, mode) : real_open(pty_path, flags);
-        if (fd >= 0) add_mapping(fd);
+        int fd = open_pty_with_retry(pty_path, flags, need_mode, mode);
+        if (fd >= 0) {
+            add_mapping(fd);
+        }
         return fd;
     }
 
@@ -412,8 +430,10 @@ int open64(const char *path, int flags, ...) {
 
     char pty_path[256];
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
-        int fd = need_mode ? real_open64(pty_path, flags, mode) : real_open(pty_path, flags);
-        if (fd >= 0) add_mapping(fd);
+        int fd = open_pty_with_retry(pty_path, flags, need_mode, mode);
+        if (fd >= 0) {
+            add_mapping(fd);
+        }
         return fd;
     }
 
@@ -453,8 +473,10 @@ int openat(int dirfd, const char *path, int flags, ...) {
 
     char pty_path[256];
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
-        int fd = need_mode ? real_open(pty_path, flags, mode) : real_open(pty_path, flags);
-        if (fd >= 0) add_mapping(fd);
+        int fd = open_pty_with_retry(pty_path, flags, need_mode, mode);
+        if (fd >= 0) {
+            add_mapping(fd);
+        }
         return fd;
     }
 
@@ -494,7 +516,7 @@ FILE *fopen(const char *path, const char *mode_str) {
     char pty_path[256];
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
         int flags = fopen_mode_to_flags(mode_str);
-        int fd = real_open(pty_path, flags, 0666);
+        int fd = open_pty_with_retry(pty_path, flags, (flags & O_CREAT) != 0, 0666);
         if (fd < 0) {
             if (allow_fallback) {
                 int fd2 = real_open(path, flags, 0666);
@@ -602,11 +624,17 @@ int fcntl(int fd, int cmd, ...) {
 int ioctl(int fd, unsigned long request, ...) {
     pthread_once(&init_once, init_once_fn);
 
+    /* Safely handle variadic args by inspecting the ioctl command itself */
+    unsigned dir = (request >> 16) & 0x3; // _IOC_DIR
+    unsigned size = (request >> 16) & 0x1fff; // _IOC_SIZE
+
     va_list ap;
-    void *argp;
-    va_start(ap, request);
-    argp = va_arg(ap, void *);
-    va_end(ap);
+    void *argp = NULL;
+    if (dir != 0 && size != 0) {
+        va_start(ap, request);
+        argp = va_arg(ap, void *);
+        va_end(ap);
+    }
 
     if (!is_mapped(fd)) {
         return passthrough_ioctl(fd, request, argp);
@@ -634,13 +662,9 @@ int ioctl(int fd, unsigned long request, ...) {
 
     unsigned char argbuf[64];
     uint32_t arglen = 0;
-    if (argp) {
-        if (sizeof(int) <= sizeof(argbuf)) {
-            memcpy(argbuf, argp, sizeof(int));
-            arglen = sizeof(int);
-        } else {
-            return passthrough_ioctl(fd, request, argp);
-        }
+    if (argp && size > 0) {
+        arglen = (size > sizeof(argbuf)) ? sizeof(argbuf) : size;
+        memcpy(argbuf, argp, arglen);
     }
 
     unsigned char outbuf[64];
@@ -656,8 +680,9 @@ int ioctl(int fd, unsigned long request, ...) {
         return -1;
     }
 
-    if (got_len >= sizeof(int) && argp) {
-        memcpy(argp, outbuf, sizeof(int));
+    if (got_len > 0 && argp) {
+        uint32_t to_copy = (got_len > size) ? size : got_len;
+        memcpy(argp, outbuf, to_copy);
     }
 
     return out_rc;

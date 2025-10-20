@@ -31,10 +31,17 @@
 static const char SM_MAGIC[4] = { 'S', 'M', 'I', 'O' };
 enum {
     REQ_IOCTL = 1,
-    REQ_TCFLSH = 2,
-    REQ_TCSENDBREAK = 3,
-    REQ_TCDRAIN = 4
+    REQ_TCFLUSH,
+    REQ_TCSENDBREAK,
+    REQ_TCDRAIN
 };
+
+/* ioctl argument types */
+typedef enum {
+    ARG_NONE = 0, /* no third argument */
+    ARG_VALUE,    /* integer value */
+    ARG_BUFFER    /* pointer to buffer */
+} ArgType;
 
 typedef enum { PRIORITY_LOW = 0, PRIORITY_HIGH = 1 } Priority;
 
@@ -215,30 +222,6 @@ void resume_low_priority_clients() {
     }
 }
 
-/* handle termios changes from PTY */
-void handle_client_ioctl_settings(int client_idx, struct termios *new_settings) {
-    pthread_mutex_lock(&sp.lock);
-    Client *c = &sp.clients[client_idx];
-    if (!c->active) {
-        pthread_mutex_unlock(&sp.lock);
-        return;
-    }
-    if (c->priority == PRIORITY_HIGH) {
-        restore_termios(sp.real_fd, new_settings);
-        update_low_priority_saves(new_settings);
-        log_msg("High priority PID %d applied new termios settings\n", c->pid);
-    } else {
-        memcpy(&c->saved_settings, new_settings, sizeof(struct termios));
-        if (c->paused) {
-            log_msg("Low priority PID %d termios settings saved (paused)\n", c->pid);
-        } else {
-            restore_termios(sp.real_fd, new_settings);
-            save_termios(sp.real_fd, &sp.current_settings);
-            log_msg("Low priority PID %d applied new termios settings\n", c->pid);
-        }
-    }
-    pthread_mutex_unlock(&sp.lock);
-}
 
 /* client disconnect cleanup */
 void handle_client_disconnect(int client_idx) {
@@ -265,27 +248,6 @@ void handle_client_disconnect(int client_idx) {
     pthread_mutex_unlock(&sp.lock);
 }
 
-/* pty ioctl polling thread */
-void* pty_ioctl_thread(void *arg) {
-    int client_idx = *(int*)arg;
-    free(arg);
-    Client *c = &sp.clients[client_idx];
-
-    while (running && c->active) {
-        struct termios new_settings;
-        if (tcgetattr(c->pty_master_fd, &new_settings) < 0) {
-            // PTY closed or error
-            break;
-        }
-        if (memcmp(&c->current_pty_settings, &new_settings, sizeof(new_settings)) != 0) {
-            memcpy(&c->current_pty_settings, &new_settings, sizeof(new_settings));
-            handle_client_ioctl_settings(client_idx, &new_settings);
-        }
-        usleep(1000);
-    }
-    handle_client_disconnect(client_idx);
-    return NULL;
-}
 
 /* pty data relay thread */
 void* pty_relay_thread(void *arg) {
@@ -369,131 +331,87 @@ void* pty_relay_thread(void *arg) {
 }
 
 /* ---------- Binary control handling (SMIO protocol) ---------- */
-
-/* Validate magic and read request header/payload then perform requested action.
-   Response format:
-     int32_t rc;
-     int32_t errno_val;
-     uint32_t out_arglen;
-     bytes[out_arglen]
-*/
-static int handle_binary_request(int ctrl_fd, uid_t peer_uid, pid_t peer_pid) {
-    // Read magic
+static int handle_binary_request(int ctrl_fd) {
     char magic[4];
-    if (robust_read_all(ctrl_fd, magic, sizeof(magic)) != (ssize_t)sizeof(magic)) return -1;
-    if (memcmp(magic, SM_MAGIC, sizeof(magic)) != 0) return -1;
+    if (robust_read_all(ctrl_fd, magic, sizeof(magic)) != sizeof(magic) || memcmp(magic, SM_MAGIC, sizeof(magic)) != 0) {
+        log_msg("Invalid magic or read error\n");
+        return -1;
+    }
 
     uint32_t req_type;
-    if (robust_read_all(ctrl_fd, &req_type, sizeof(req_type)) != (ssize_t)sizeof(req_type)) return -1;
+    if (robust_read_all(ctrl_fd, &req_type, sizeof(req_type)) != sizeof(req_type)) return -1;
 
-    // We'll hold sp.lock when calling ioctls/tc* to ensure consistency
-    int32_t rc = -1;
-    int32_t err_no = 0;
+    int32_t rc = -1, err_no = 0;
     uint32_t out_arglen = 0;
-    unsigned char outbuf[64] = {0};
+    void *out_buf = NULL;
+    void *arg_buf = NULL;
 
-    pthread_mutex_lock(&sp.lock);
-    int real_fd = sp.real_fd;
-    pthread_mutex_unlock(&sp.lock);
+    if (req_type == REQ_IOCTL) {
+        uint64_t req64;
+        uint32_t arg_type, arglen;
 
-    switch (req_type) {
-        case REQ_IOCTL: {
-            uint64_t req64 = 0;
-            if (robust_read_all(ctrl_fd, &req64, sizeof(req64)) != (ssize_t)sizeof(req64)) { err_no = EIO; break; }
-            uint32_t arglen = 0;
-            if (robust_read_all(ctrl_fd, &arglen, sizeof(arglen)) != (ssize_t)sizeof(arglen)) { err_no = EIO; break; }
-            if (arglen > 64) { err_no = EINVAL; break; } // too large
-            unsigned char argbuf[64];
-            if (arglen > 0) {
-                if (robust_read_all(ctrl_fd, argbuf, arglen) != (ssize_t)arglen) { err_no = EIO; break; }
-            }
-            unsigned long request = (unsigned long)req64;
-            void *argp = NULL;
-            struct termios local_termios;
-            int local_int = 0;
+        if (robust_read_all(ctrl_fd, &req64, sizeof(req64)) != sizeof(req64)) { err_no = EIO; goto respond; }
+        if (robust_read_all(ctrl_fd, &arg_type, sizeof(arg_type)) != sizeof(arg_type)) { err_no = EIO; goto respond; }
+        if (robust_read_all(ctrl_fd, &arglen, sizeof(arglen)) != sizeof(arglen)) { err_no = EIO; goto respond; }
 
-            if (request == TCGETS) {
-                argp = &local_termios;
-            } else if (arglen > 0) {
-                if (arglen == sizeof(struct termios) && (request == TCSETS || request == TCSETSW || request == TCSETSF)) {
-                    memcpy(&local_termios, argbuf, sizeof(struct termios));
-                    argp = &local_termios;
-                } else if (arglen >= sizeof(int)) {
-                    memcpy(&local_int, argbuf, sizeof(int));
-                    argp = &local_int;
-                }
-            }
-
-            // perform ioctl under lock
-            pthread_mutex_lock(&sp.lock);
-            int ioctl_ret = ioctl(real_fd, request, argp);
-            int saved_errno = (ioctl_ret < 0) ? errno : 0;
-            if (ioctl_ret >= 0 && argp) {
-                if (request == TCGETS) {
-                    memcpy(outbuf, &local_termios, sizeof(struct termios));
-                    out_arglen = sizeof(struct termios);
-                } else if (_IOC_DIR(request) & _IOC_READ) {
-                    int v = local_int;
-                    memcpy(outbuf, &v, sizeof(int));
-                    out_arglen = sizeof(int);
-                }
-            }
-            pthread_mutex_unlock(&sp.lock);
-
-            if (ioctl_ret < 0) {
-                rc = -1;
-                err_no = saved_errno;
-            } else {
-                rc = ioctl_ret;
-                err_no = 0;
-            }
-            break;
+        if (arglen > 0) {
+            arg_buf = malloc(arglen);
+            if (!arg_buf) { err_no = ENOMEM; goto respond; }
+            if (robust_read_all(ctrl_fd, arg_buf, arglen) != arglen) { err_no = EIO; goto respond; }
         }
-        case REQ_TCFLSH: {
-            int32_t sel = 0;
-            if (robust_read_all(ctrl_fd, &sel, sizeof(sel)) != (ssize_t)sizeof(sel)) { err_no = EIO; break; }
-            pthread_mutex_lock(&sp.lock);
-            int tret = tcflush(sp.real_fd, sel);
-            int saved_errno = (tret < 0) ? errno : 0;
-            pthread_mutex_unlock(&sp.lock);
-            if (tret < 0) { rc = -1; err_no = saved_errno; }
-            else { rc = 0; err_no = 0; }
-            break;
+
+        unsigned long request = (unsigned long)req64;
+        void *argp = NULL;
+        if (arg_type == ARG_VALUE) {
+            memcpy(&argp, arg_buf, sizeof(argp));
+        } else if (arg_type == ARG_BUFFER) {
+            argp = arg_buf;
         }
-        case REQ_TCSENDBREAK: {
-            int32_t dur = 0;
-            if (robust_read_all(ctrl_fd, &dur, sizeof(dur)) != (ssize_t)sizeof(dur)) { err_no = EIO; break; }
-            pthread_mutex_lock(&sp.lock);
-            int tret = tcsendbreak(sp.real_fd, dur);
-            int saved_errno = (tret < 0) ? errno : 0;
-            pthread_mutex_unlock(&sp.lock);
-            if (tret < 0) { rc = -1; err_no = saved_errno; }
-            else { rc = 0; err_no = 0; }
-            break;
+
+        log_msg("Executing ioctl req=0x%lx, arg_type=%d, arglen=%u\n", request, arg_type, arglen);
+
+        pthread_mutex_lock(&sp.lock);
+        rc = ioctl(sp.real_fd, request, argp);
+        err_no = (rc < 0) ? errno : 0;
+        if (rc >= 0 && argp && (_IOC_DIR(request) & _IOC_READ)) {
+            out_arglen = _IOC_SIZE(request);
+            if (out_arglen > 0) {
+                out_buf = malloc(out_arglen);
+                if (out_buf) memcpy(out_buf, argp, out_arglen);
+                else { log_msg("ENOMEM for ioctl read buffer\n"); out_arglen = 0; }
+            }
         }
-        case REQ_TCDRAIN: {
-            pthread_mutex_lock(&sp.lock);
-            int tret = tcdrain(sp.real_fd);
-            int saved_errno = (tret < 0) ? errno : 0;
-            pthread_mutex_unlock(&sp.lock);
-            if (tret < 0) { rc = -1; err_no = saved_errno; }
-            else { rc = 0; err_no = 0; }
-            break;
-        }
-        default:
-            err_no = ENOSYS;
-            rc = -1;
-            break;
+        pthread_mutex_unlock(&sp.lock);
+
+    } else if (req_type == REQ_TCFLUSH || req_type == REQ_TCSENDBREAK) {
+        int arg = 0;
+        if (robust_read_all(ctrl_fd, &arg, sizeof(arg)) != sizeof(arg)) { err_no = EIO; goto respond; }
+        pthread_mutex_lock(&sp.lock);
+        if (req_type == REQ_TCFLUSH) rc = tcflush(sp.real_fd, arg);
+        else rc = tcsendbreak(sp.real_fd, arg);
+        err_no = (rc < 0) ? errno : 0;
+        pthread_mutex_unlock(&sp.lock);
+
+    } else if (req_type == REQ_TCDRAIN) {
+        pthread_mutex_lock(&sp.lock);
+        rc = tcdrain(sp.real_fd);
+        err_no = (rc < 0) ? errno : 0;
+        pthread_mutex_unlock(&sp.lock);
+
+    } else {
+        err_no = ENOSYS;
     }
 
-    // send response header and optional outbuf
-    // Use robust_write for safety
-    if (robust_write(ctrl_fd, &rc, sizeof(rc)) < 0) return -1;
-    if (robust_write(ctrl_fd, &err_no, sizeof(err_no)) < 0) return -1;
-    if (robust_write(ctrl_fd, &out_arglen, sizeof(out_arglen)) < 0) return -1;
-    if (out_arglen > 0) {
-        if (robust_write(ctrl_fd, outbuf, out_arglen) < 0) return -1;
+respond:
+    if (robust_write(ctrl_fd, &rc, sizeof(rc)) < 0) { /* ignore */ }
+    if (robust_write(ctrl_fd, &err_no, sizeof(err_no)) < 0) { /* ignore */ }
+    if (robust_write(ctrl_fd, &out_arglen, sizeof(out_arglen)) < 0) { /* ignore */ }
+    if (out_arglen > 0 && out_buf) {
+        if (robust_write(ctrl_fd, out_buf, out_arglen) < 0) { /* ignore */ }
     }
+
+    free(arg_buf);
+    free(out_buf);
     return 0;
 }
 
@@ -508,10 +426,7 @@ void* client_control_thread(void *arg) {
     char peek[4];
     ssize_t p = recv(client_fd, peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT);
     if (p == (ssize_t)sizeof(peek) && memcmp(peek, SM_MAGIC, sizeof(peek)) == 0) {
-        // handle binary request (handle_binary_request will read the magic itself)
-        uid_t peer_uid = (uid_t)-1;
-        pid_t peer_pid = (pid_t)-1;
-        handle_binary_request(client_fd, peer_uid, peer_pid);
+        handle_binary_request(client_fd);
         close(client_fd);
         return NULL;
     }
@@ -619,23 +534,6 @@ void* client_control_thread(void *arg) {
             return NULL;
         }
         pthread_detach(relay_tid);
-
-        int *pidx2 = malloc(sizeof(int));
-        if (!pidx2) {
-            log_msg("malloc failed for pidx2\n");
-            handle_client_disconnect(idx);
-            close(client_fd);
-            return NULL;
-        }
-        *pidx2 = idx;
-        if (pthread_create(&ioctl_tid, NULL, pty_ioctl_thread, pidx2) != 0) {
-            log_msg("pthread_create ioctl failed\n");
-            handle_client_disconnect(idx);
-            free(pidx2);
-            close(client_fd);
-            return NULL;
-        }
-        pthread_detach(ioctl_tid);
 
     } else if (strncmp(buf, "CLOSE:", 6) == 0) {
         pid_t pid = (pid_t)atoi(buf + 6);

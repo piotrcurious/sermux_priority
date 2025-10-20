@@ -624,26 +624,44 @@ int fcntl(int fd, int cmd, ...) {
 int ioctl(int fd, unsigned long request, ...) {
     pthread_once(&init_once, init_once_fn);
 
-    /* Safely handle variadic args by inspecting the ioctl command itself */
-    unsigned dir = (request >> 16) & 0x3; // _IOC_DIR
-    unsigned size = (request >> 16) & 0x1fff; // _IOC_SIZE
-
-    va_list ap;
+    // Safely determine argp only if the ioctl uses it
     void *argp = NULL;
-    if (dir != 0 && size != 0) {
+    if (_IOC_DIR(request) != _IOC_NONE) {
+        va_list ap;
         va_start(ap, request);
         argp = va_arg(ap, void *);
         va_end(ap);
     }
 
+    // If fd is not mapped, just pass through. The argp logic above is now safe for all cases.
     if (!is_mapped(fd)) {
         return passthrough_ioctl(fd, request, argp);
     }
 
-    /* All ioctl requests are forwarded to the daemon */
+    // For mapped fds (our PTY), decide what to do with the ioctl.
+    // termios ioctls must be executed on the PTY itself.
+    switch (request) {
+        case TCGETS:
+        case TCSETS:
+        case TCSETSW:
+        case TCSETSF:
+#ifdef TCGETA
+        case TCGETA:
+        case TCSETA:
+        case TCSETAW:
+        case TCSETAF:
+#endif
+            return passthrough_ioctl(fd, request, argp);
+        default:
+            // All other ioctls are forwarded to the daemon
+            break;
+    }
 
-    unsigned char argbuf[sizeof(struct termios)];
+    // Forward the ioctl to the daemon
+    size_t size = _IOC_SIZE(request);
+    unsigned char argbuf[sizeof(struct termios)]; // Use a buffer large enough for termios
     uint32_t arglen = 0;
+
     if (argp && size > 0) {
         arglen = (size > sizeof(argbuf)) ? sizeof(argbuf) : size;
         memcpy(argbuf, argp, arglen);
@@ -652,9 +670,13 @@ int ioctl(int fd, unsigned long request, ...) {
     unsigned char outbuf[sizeof(struct termios)];
     uint32_t got_len = 0;
     int daemon_errno = 0, out_rc = 0;
+
     if (send_request_and_get_response(REQ_IOCTL, (uint64_t)request, argbuf, arglen, &daemon_errno, outbuf, sizeof(outbuf), &got_len, &out_rc) < 0) {
-        if (allow_fallback) return passthrough_ioctl(fd, request, argp);
-        errno = EIO; return -1;
+        if (allow_fallback) {
+            return passthrough_ioctl(fd, request, argp);
+        }
+        errno = EIO;
+        return -1;
     }
 
     if (out_rc < 0) {
@@ -662,8 +684,9 @@ int ioctl(int fd, unsigned long request, ...) {
         return -1;
     }
 
-    if (got_len > 0 && argp) {
-        uint32_t to_copy = (got_len > size) ? size : got_len;
+    // Copy back data if the ioctl was a read command
+    if (argp && got_len > 0 && (_IOC_DIR(request) & _IOC_READ)) {
+        size_t to_copy = (got_len > size) ? size : got_len;
         memcpy(argp, outbuf, to_copy);
     }
 

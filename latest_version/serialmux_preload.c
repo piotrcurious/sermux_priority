@@ -36,9 +36,12 @@ enum {
     REQ_TCDRAIN = 4
 };
 
+typedef enum { PRIORITY_LOW = 0, PRIORITY_HIGH = 1 } Priority;
+
 typedef struct {
     int fd;
     pid_t pid;
+    Priority priority;
 } FDMapping;
 
 static FDMapping fd_map[MAX_MAPPED_FDS];
@@ -78,7 +81,7 @@ static void debug_log(const char *fmt, ...) {
 }
 
 /* mapping helpers */
-static void add_mapping(int fd) {
+static void add_mapping(int fd, Priority priority) {
     if (fd < 0) return;
     pthread_mutex_lock(&map_lock);
     for (int i = 0; i < num_mapped; ++i) {
@@ -87,6 +90,7 @@ static void add_mapping(int fd) {
     if (num_mapped < MAX_MAPPED_FDS) {
         fd_map[num_mapped].fd = fd;
         fd_map[num_mapped].pid = getpid();
+        fd_map[num_mapped].priority = priority;
         ++num_mapped;
     } else {
         debug_log("mapping overflow, cannot track fd %d", fd);
@@ -390,10 +394,11 @@ int open(const char *path, int flags, ...) {
     }
 
     char pty_path[256];
+    Priority prio = (getenv("SERIALMUX_PRIORITY") && strcmp(getenv("SERIALMUX_PRIORITY"), "HIGH") == 0) ? PRIORITY_HIGH : PRIORITY_LOW;
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
         int fd = open_pty_with_retry(pty_path, flags, need_mode, mode);
         if (fd >= 0) {
-            add_mapping(fd);
+            add_mapping(fd, prio);
         }
         return fd;
     }
@@ -429,10 +434,11 @@ int open64(const char *path, int flags, ...) {
     }
 
     char pty_path[256];
+    Priority prio = (getenv("SERIALMUX_PRIORITY") && strcmp(getenv("SERIALMUX_PRIORITY"), "HIGH") == 0) ? PRIORITY_HIGH : PRIORITY_LOW;
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
         int fd = open_pty_with_retry(pty_path, flags, need_mode, mode);
         if (fd >= 0) {
-            add_mapping(fd);
+            add_mapping(fd, prio);
         }
         return fd;
     }
@@ -472,10 +478,11 @@ int openat(int dirfd, const char *path, int flags, ...) {
     }
 
     char pty_path[256];
+    Priority prio = (getenv("SERIALMUX_PRIORITY") && strcmp(getenv("SERIALMUX_PRIORITY"), "HIGH") == 0) ? PRIORITY_HIGH : PRIORITY_LOW;
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
         int fd = open_pty_with_retry(pty_path, flags, need_mode, mode);
         if (fd >= 0) {
-            add_mapping(fd);
+            add_mapping(fd, prio);
         }
         return fd;
     }
@@ -514,6 +521,7 @@ FILE *fopen(const char *path, const char *mode_str) {
     }
 
     char pty_path[256];
+    Priority prio = (getenv("SERIALMUX_PRIORITY") && strcmp(getenv("SERIALMUX_PRIORITY"), "HIGH") == 0) ? PRIORITY_HIGH : PRIORITY_LOW;
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
         int flags = fopen_mode_to_flags(mode_str);
         int fd = open_pty_with_retry(pty_path, flags, (flags & O_CREAT) != 0, 0666);
@@ -527,7 +535,7 @@ FILE *fopen(const char *path, const char *mode_str) {
             }
             return NULL;
         }
-        add_mapping(fd);
+        add_mapping(fd, prio);
         FILE *f = real_fdopen(fd, mode_str);
         if (!f) { remove_mapping(fd); real_close(fd); return NULL; }
         return f;
@@ -574,7 +582,18 @@ int close(int fd) {
 int dup(int oldfd) {
     pthread_once(&init_once, init_once_fn);
     int newfd = real_dup(oldfd);
-    if (newfd >= 0 && is_mapped(oldfd)) add_mapping(newfd);
+    if (newfd >= 0 && is_mapped(oldfd)) {
+        pthread_mutex_lock(&map_lock);
+        Priority p = PRIORITY_LOW;
+        for (int i = 0; i < num_mapped; ++i) {
+            if (fd_map[i].fd == oldfd) {
+                p = fd_map[i].priority;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&map_lock);
+        add_mapping(newfd, p);
+    }
     return newfd;
 }
 
@@ -583,8 +602,20 @@ int dup2(int oldfd, int newfd) {
     pthread_once(&init_once, init_once_fn);
     int r = real_dup2(oldfd, newfd);
     if (r >= 0) {
-        if (is_mapped(oldfd)) add_mapping(newfd);
-        else remove_mapping(newfd);
+        if (is_mapped(oldfd)) {
+            pthread_mutex_lock(&map_lock);
+            Priority p = PRIORITY_LOW;
+            for (int i = 0; i < num_mapped; ++i) {
+                if (fd_map[i].fd == oldfd) {
+                    p = fd_map[i].priority;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&map_lock);
+            add_mapping(newfd, p);
+        } else {
+            remove_mapping(newfd);
+        }
     }
     return r;
 }
@@ -596,8 +627,20 @@ int dup3(int oldfd, int newfd, int flags) {
     if (real_dup3) r = real_dup3(oldfd, newfd, flags);
     else r = real_dup2(oldfd, newfd);
     if (r >= 0) {
-        if (is_mapped(oldfd)) add_mapping(newfd);
-        else remove_mapping(newfd);
+        if (is_mapped(oldfd)) {
+            pthread_mutex_lock(&map_lock);
+            Priority p = PRIORITY_LOW;
+            for (int i = 0; i < num_mapped; ++i) {
+                if (fd_map[i].fd == oldfd) {
+                    p = fd_map[i].priority;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&map_lock);
+            add_mapping(newfd, p);
+        } else {
+            remove_mapping(newfd);
+        }
     }
     return r;
 }
@@ -612,7 +655,18 @@ int fcntl(int fd, int cmd, ...) {
 
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
         int newfd = real_fcntl(fd, cmd, arg);
-        if (newfd >= 0 && is_mapped(fd)) add_mapping(newfd);
+        if (newfd >= 0 && is_mapped(fd)) {
+            pthread_mutex_lock(&map_lock);
+            Priority p = PRIORITY_LOW;
+            for (int i = 0; i < num_mapped; ++i) {
+                if (fd_map[i].fd == fd) {
+                    p = fd_map[i].priority;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&map_lock);
+            add_mapping(newfd, p);
+        }
         return newfd;
     }
 
@@ -632,12 +686,18 @@ int ioctl(int fd, unsigned long request, ...) {
         va_end(ap);
     }
 
+    // If the fd is not one we manage, or if it's not a terminal,
+    // we should not intercept the ioctl. isatty() is the most
+    // direct way to check this, as requested by user feedback.
     if (!is_mapped(fd) || !isatty(fd)) {
         return passthrough_ioctl(fd, request, argp);
     }
 
-    // All ioctls for our mapped TTYs are forwarded to the daemon.
-    // The daemon will handle termios settings correctly.
+    // All ioctls on a mapped TTY, including termios settings like TCSETS,
+    // must be forwarded to the daemon for synchronous handling. Passing them
+    // through to the PTY would create a race condition where the application
+    // proceeds before the physical serial port is configured.
+
     size_t size = _IOC_SIZE(request);
     unsigned char argbuf[sizeof(struct termios)];
     uint32_t arglen = 0;

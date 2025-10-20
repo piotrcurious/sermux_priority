@@ -265,27 +265,11 @@ void handle_client_disconnect(int client_idx) {
     pthread_mutex_unlock(&sp.lock);
 }
 
-/* pty ioctl polling thread */
-void* pty_ioctl_thread(void *arg) {
-    int client_idx = *(int*)arg;
-    free(arg);
-    Client *c = &sp.clients[client_idx];
-
-    while (running && c->active) {
-        struct termios new_settings;
-        if (tcgetattr(c->pty_master_fd, &new_settings) < 0) {
-            // PTY closed or error
-            break;
-        }
-        if (memcmp(&c->current_pty_settings, &new_settings, sizeof(new_settings)) != 0) {
-            memcpy(&c->current_pty_settings, &new_settings, sizeof(new_settings));
-            handle_client_ioctl_settings(client_idx, &new_settings);
-        }
-        usleep(1000);
-    }
-    handle_client_disconnect(client_idx);
-    return NULL;
-}
+/* pty_ioctl_thread is removed. All ioctl/termios handling is now done
+ * synchronously via the binary SMIO protocol, which is initiated by the
+ * preload library. This eliminates the race condition where an application
+ * could proceed before the physical serial port settings were applied.
+ */
 
 /* pty data relay thread */
 void* pty_relay_thread(void *arg) {
@@ -600,7 +584,7 @@ void* client_control_thread(void *arg) {
         pthread_mutex_unlock(&sp.lock);
 
         // spawn threads for this client
-        pthread_t relay_tid, ioctl_tid;
+        pthread_t relay_tid;
         int *pidx = malloc(sizeof(int));
         if (!pidx) {
             log_msg("malloc failed for pidx\n");
@@ -619,23 +603,6 @@ void* client_control_thread(void *arg) {
             return NULL;
         }
         pthread_detach(relay_tid);
-
-        int *pidx2 = malloc(sizeof(int));
-        if (!pidx2) {
-            log_msg("malloc failed for pidx2\n");
-            handle_client_disconnect(idx);
-            close(client_fd);
-            return NULL;
-        }
-        *pidx2 = idx;
-        if (pthread_create(&ioctl_tid, NULL, pty_ioctl_thread, pidx2) != 0) {
-            log_msg("pthread_create ioctl failed\n");
-            handle_client_disconnect(idx);
-            free(pidx2);
-            close(client_fd);
-            return NULL;
-        }
-        pthread_detach(ioctl_tid);
 
     } else if (strncmp(buf, "CLOSE:", 6) == 0) {
         pid_t pid = (pid_t)atoi(buf + 6);

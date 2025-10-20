@@ -624,7 +624,6 @@ int fcntl(int fd, int cmd, ...) {
 int ioctl(int fd, unsigned long request, ...) {
     pthread_once(&init_once, init_once_fn);
 
-    // Safely determine argp only if the ioctl uses it
     void *argp = NULL;
     if (_IOC_DIR(request) != _IOC_NONE) {
         va_list ap;
@@ -633,13 +632,13 @@ int ioctl(int fd, unsigned long request, ...) {
         va_end(ap);
     }
 
-    // If fd is not mapped, just pass through. The argp logic above is now safe for all cases.
-    if (!is_mapped(fd)) {
+    if (!is_mapped(fd) || !isatty(fd)) {
+        if (is_mapped(fd)) {
+            remove_mapping(fd);
+        }
         return passthrough_ioctl(fd, request, argp);
     }
 
-    // For mapped fds (our PTY), decide what to do with the ioctl.
-    // termios ioctls must be executed on the PTY itself.
     switch (request) {
         case TCGETS:
         case TCSETS:
@@ -653,13 +652,11 @@ int ioctl(int fd, unsigned long request, ...) {
 #endif
             return passthrough_ioctl(fd, request, argp);
         default:
-            // All other ioctls are forwarded to the daemon
             break;
     }
 
-    // Forward the ioctl to the daemon
     size_t size = _IOC_SIZE(request);
-    unsigned char argbuf[sizeof(struct termios)]; // Use a buffer large enough for termios
+    unsigned char argbuf[sizeof(struct termios)];
     uint32_t arglen = 0;
 
     if (argp && size > 0) {
@@ -684,7 +681,6 @@ int ioctl(int fd, unsigned long request, ...) {
         return -1;
     }
 
-    // Copy back data if the ioctl was a read command
     if (argp && got_len > 0 && (_IOC_DIR(request) & _IOC_READ)) {
         size_t to_copy = (got_len > size) ? size : got_len;
         memcpy(argp, outbuf, to_copy);

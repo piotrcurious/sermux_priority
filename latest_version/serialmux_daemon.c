@@ -332,9 +332,12 @@ void* pty_relay_thread(void *arg) {
                 if (n > 0) {
                     ssize_t w = write(pty_fd, buf, n);
                     (void)w;
+                } else if (n == 0) {
+                    log_msg("Real serial port hangup (read=0). Terminating relay for client %d.\n", client_idx);
+                    break;
                 } else {
-                    log_msg("Real serial port error/closed (read=%zd). Stopping daemon.\n", n);
-                    running = 0;
+                    log_msg("Real serial port error (read=%zd). Stopping daemon.\n", n);
+                    running = 0; // Fatal error
                     break;
                 }
             }

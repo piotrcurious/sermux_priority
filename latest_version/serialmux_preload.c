@@ -682,7 +682,7 @@ int ioctl(int fd, unsigned long request, ...) {
     if (_IOC_DIR(request) != _IOC_NONE) {
         va_list ap;
         va_start(ap, request);
-        argp = va_arg(ap, void *);
+        argp = va_arg(ap, char *);
         va_end(ap);
     }
 

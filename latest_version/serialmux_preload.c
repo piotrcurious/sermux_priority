@@ -612,24 +612,24 @@ int ioctl(int fd, unsigned long request, ...) {
         return passthrough_ioctl(fd, request, argp);
     }
 
-    /* Forward all ioctls to the daemon *except* for termios settings requests.
-     * Termios settings are handled by applying them to the PTY, and the
-     * daemon will pick up the changes by polling tcgetattr() on its end. */
     switch (request) {
-        case TCGETS:
-        case TCSETS:
-        case TCSETSW:
-        case TCSETSF:
-#ifdef TCGETA
-        case TCGETA:
-        case TCSETA:
-        case TCSETAW:
-        case TCSETAF:
+        case TIOCMGET:
+        case TIOCMSET:
+#ifdef TIOCMBIS
+        case TIOCMBIS:
 #endif
-            return passthrough_ioctl(fd, request, argp);
-        default:
-            /* All others are forwarded */
+#ifdef TIOCMBIC
+        case TIOCMBIC:
+#endif
+#ifdef TIOCSBRK
+        case TIOCSBRK:
+#endif
+#ifdef TIOCCBRK
+        case TIOCCBRK:
+#endif
             break;
+        default:
+            return passthrough_ioctl(fd, request, argp);
     }
 
     unsigned char argbuf[64];

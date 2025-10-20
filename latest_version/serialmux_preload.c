@@ -576,18 +576,25 @@ static int send_request(int req_type, int fd, unsigned long request, void *argp)
         size_t arg_size = _IOC_SIZE(request);
         int dir = _IOC_DIR(request);
 
-        if (arg_size == 0 && argp != NULL) {
-            ioctl_req.arg_type = ARG_VALUE;
-            ioctl_req.arg_len = sizeof(int);
-            hdr.payload_len = sizeof(ioctl_req) + sizeof(int);
-        } else if (argp && (dir & _IOC_WRITE)) {
-            ioctl_req.arg_type = ARG_BUFFER;
-            ioctl_req.arg_len = arg_size;
-            hdr.payload_len = sizeof(ioctl_req) + ioctl_req.arg_len;
-        } else {
-            ioctl_req.arg_type = ARG_NONE;
-            ioctl_req.arg_len = 0;
-            hdr.payload_len = sizeof(ioctl_req);
+        switch (request) {
+            case TIOCMBIS:
+            case TIOCMBIC:
+            case TIOCMSET:
+                ioctl_req.arg_type = ARG_VALUE;
+                ioctl_req.arg_len = sizeof(int);
+                hdr.payload_len = sizeof(ioctl_req) + sizeof(int);
+                break;
+            default:
+                if (argp && (dir & _IOC_WRITE)) {
+                    ioctl_req.arg_type = ARG_BUFFER;
+                    ioctl_req.arg_len = arg_size;
+                    hdr.payload_len = sizeof(ioctl_req) + ioctl_req.arg_len;
+                } else {
+                    ioctl_req.arg_type = ARG_NONE;
+                    ioctl_req.arg_len = 0;
+                    hdr.payload_len = sizeof(ioctl_req);
+                }
+                break;
         }
     }
 
@@ -610,14 +617,22 @@ static int send_request(int req_type, int fd, unsigned long request, void *argp)
                 return -1;
             }
         } else if (ioctl_req.arg_type == ARG_VALUE) {
-            if (send_all(sock, argp, sizeof(int)) != sizeof(int)) {
+            int val = (int)(intptr_t)argp;
+            if (send_all(sock, &val, sizeof(int)) != sizeof(int)) {
                 close(sock);
                 errno = EIO;
                 return -1;
             }
         }
     } else {
-        if (send_all(sock, argp, sizeof(int)) != sizeof(int)) {
+        if (argp == NULL) { // For tcdrain
+             if (send_all(sock, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+                close(sock);
+                errno = EIO;
+                return -1;
+            }
+        }
+        else if (send_all(sock, argp, sizeof(int)) != sizeof(int)) {
             close(sock);
             errno = EIO;
             return -1;

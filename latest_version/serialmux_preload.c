@@ -633,35 +633,20 @@ int ioctl(int fd, unsigned long request, ...) {
     }
 
     if (!is_mapped(fd) || !isatty(fd)) {
-        if (is_mapped(fd)) {
-            remove_mapping(fd);
-        }
         return passthrough_ioctl(fd, request, argp);
     }
 
-    switch (request) {
-        case TCGETS:
-        case TCSETS:
-        case TCSETSW:
-        case TCSETSF:
-#ifdef TCGETA
-        case TCGETA:
-        case TCSETA:
-        case TCSETAW:
-        case TCSETAF:
-#endif
-            return passthrough_ioctl(fd, request, argp);
-        default:
-            break;
-    }
-
+    // All ioctls for our mapped TTYs are forwarded to the daemon.
+    // The daemon will handle termios settings correctly.
     size_t size = _IOC_SIZE(request);
     unsigned char argbuf[sizeof(struct termios)];
     uint32_t arglen = 0;
 
     if (argp && size > 0) {
         arglen = (size > sizeof(argbuf)) ? sizeof(argbuf) : size;
-        memcpy(argbuf, argp, arglen);
+        if ((_IOC_DIR(request) & _IOC_WRITE)) {
+            memcpy(argbuf, argp, arglen);
+        }
     }
 
     unsigned char outbuf[sizeof(struct termios)];

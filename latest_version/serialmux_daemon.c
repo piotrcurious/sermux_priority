@@ -412,7 +412,9 @@ static int handle_binary_request(int ctrl_fd, uid_t peer_uid, pid_t peer_pid) {
             struct termios local_termios;
             int local_int = 0;
 
-            if (arglen > 0) {
+            if (request == TCGETS) {
+                argp = &local_termios;
+            } else if (arglen > 0) {
                 if (arglen == sizeof(struct termios) && (request == TCSETS || request == TCSETSW || request == TCSETSF)) {
                     memcpy(&local_termios, argbuf, sizeof(struct termios));
                     argp = &local_termios;
@@ -426,12 +428,11 @@ static int handle_binary_request(int ctrl_fd, uid_t peer_uid, pid_t peer_pid) {
             pthread_mutex_lock(&sp.lock);
             int ioctl_ret = ioctl(real_fd, request, argp);
             int saved_errno = (ioctl_ret < 0) ? errno : 0;
-            // if request returns data, copy it out
             if (ioctl_ret >= 0 && argp) {
                 if (request == TCGETS) {
                     memcpy(outbuf, &local_termios, sizeof(struct termios));
                     out_arglen = sizeof(struct termios);
-                } else if ((request >> 8 & 0xff) == 'T' || (request >> 8 & 0xff) == 'f') { // TIOC... or FIO...
+                } else if (_IOC_DIR(request) & _IOC_READ) {
                     int v = local_int;
                     memcpy(outbuf, &v, sizeof(int));
                     out_arglen = sizeof(int);

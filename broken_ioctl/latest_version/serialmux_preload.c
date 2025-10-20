@@ -660,11 +660,6 @@ int ioctl(int fd, unsigned long request, ...) {
     if (!is_mapped(fd)) {
         return passthrough_ioctl(fd, request, argp);
     }
-    /* The check 'isatty' is important because it prevents us from hijacking
-     * ioctls on non-terminal devices that might share the same fd number,
-     * such as network sockets. This was a significant issue in a previous
-     * version of this software.
-     */
     if (!isatty(fd)) {
         debug_log("passthrough ioctl on non-tty fd=%d req=0x%lx", fd, request);
         return passthrough_ioctl(fd, request, argp);
@@ -676,33 +671,29 @@ int ioctl(int fd, unsigned long request, ...) {
     const void *arg_data = NULL;
     uint32_t arglen = 0;
     size_t ioctl_size = _IOC_SIZE(request);
-
     unsigned long dir = _IOC_DIR(request);
+    intptr_t arg_as_val = (intptr_t)argp;
 
     if (argp == NULL) {
         arg_type = ARG_NONE;
         arg_data = NULL;
         arglen = 0;
+    } else if (dir == _IOC_NONE) {
+        // No direction. Assume argument is a value (e.g., TCSBRK).
+        arg_type = ARG_VALUE;
+        arg_data = &arg_as_val;
+        arglen = sizeof(arg_as_val);
     } else {
-        // Default to ARG_BUFFER as it's the most common and safest case for TTY ioctls.
-        // The fatal error is misinterpreting a pointer as a value.
+        // Direction is R, W, or RW. Argument MUST be a pointer.
         arg_type = ARG_BUFFER;
         arg_data = argp;
         arglen = (uint32_t)ioctl_size;
-
-        // For old-style ioctls (like TIOCMBIS) or new ioctls with pointer
-        // types, the size can be encoded as 0. We default to sizeof(int)
-        // as this is correct for most modem/control line ioctls.
-        if (arglen == 0 && dir != _IOC_NONE) {
-            arglen = sizeof(int);
-        } else if (dir == _IOC_NONE) {
-            // This case handles legacy ioctls like FIONREAD (0x541B) where
-            // direction info is missing but a pointer argument is expected.
+        if (arglen == 0) {
+            // Size not encoded (legacy ioctl), default to sizeof(int).
             arglen = sizeof(int);
         }
     }
 
-    // Output buffer for READ ioctls
     unsigned char outbuf[4096];
     uint32_t got_len = 0;
     int daemon_errno = 0, out_rc = 0;
@@ -710,7 +701,7 @@ int ioctl(int fd, unsigned long request, ...) {
     // For read-only ioctls, arg_data points to user memory but may contain
     // stale data. We send a zeroed buffer to the daemon to prevent issues.
     unsigned char dummy_buf[arglen];
-    if (dir == _IOC_READ && arglen > 0) {
+    if (arg_type == ARG_BUFFER && (dir & _IOC_WRITE) == 0 && arglen > 0) {
         memset(dummy_buf, 0, arglen);
         arg_data = dummy_buf;
     }
@@ -730,9 +721,11 @@ int ioctl(int fd, unsigned long request, ...) {
         return -1;
     }
 
-    if (argp && got_len > 0 && (_IOC_DIR(request) & _IOC_READ)) {
-        size_t to_copy = (got_len > ioctl_size) ? ioctl_size : got_len;
-        memcpy(argp, outbuf, to_copy);
+    if (argp && got_len > 0 && (dir & _IOC_READ)) {
+        size_t to_copy = (got_len > arglen) ? arglen : got_len;
+        if (to_copy > 0) {
+            memcpy(argp, outbuf, to_copy);
+        }
     }
 
     return out_rc;

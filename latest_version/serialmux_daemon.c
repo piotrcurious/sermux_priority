@@ -330,8 +330,7 @@ void* pty_relay_thread(void *arg) {
             if (!paused) {
                 ssize_t n = read(real_fd, buf, sizeof(buf));
                 if (n > 0) {
-                    ssize_t w = write(pty_fd, buf, n);
-                    (void)w;
+                    robust_write(pty_fd, buf, n);
                 } else if (n == 0) {
                     log_msg("Real serial port hangup (read=0). Terminating relay for client %d.\n", client_idx);
                     break;
@@ -346,8 +345,7 @@ void* pty_relay_thread(void *arg) {
             ssize_t n = read(pty_fd, buf, sizeof(buf));
             if (n > 0) {
                 if (!paused) {
-                    ssize_t w = write(real_fd, buf, n);
-                    (void)w;
+                    robust_write(real_fd, buf, n);
                 }
             } else {
                 // PTY closed
@@ -410,21 +408,30 @@ static int handle_binary_request(int ctrl_fd, uid_t peer_uid, pid_t peer_pid) {
                 if (robust_read_all(ctrl_fd, argbuf, arglen) != (ssize_t)arglen) { err_no = EIO; break; }
             }
             unsigned long request = (unsigned long)req64;
-            // prepare arg pointer (many modem ioctls use int)
-            int local_int = 0;
             void *argp = NULL;
-            if (arglen >= (uint32_t)sizeof(int)) {
-                memcpy(&local_int, argbuf, sizeof(int));
-                argp = &local_int;
+            struct termios local_termios;
+            int local_int = 0;
+
+            if (arglen > 0) {
+                if (arglen == sizeof(struct termios) && (request == TCSETS || request == TCSETSW || request == TCSETSF)) {
+                    memcpy(&local_termios, argbuf, sizeof(struct termios));
+                    argp = &local_termios;
+                } else if (arglen >= sizeof(int)) {
+                    memcpy(&local_int, argbuf, sizeof(int));
+                    argp = &local_int;
+                }
             }
 
             // perform ioctl under lock
             pthread_mutex_lock(&sp.lock);
             int ioctl_ret = ioctl(real_fd, request, argp);
             int saved_errno = (ioctl_ret < 0) ? errno : 0;
-            // if request returns data (e.g. TIOCMGET, FIONREAD), copy it out
+            // if request returns data, copy it out
             if (ioctl_ret >= 0 && argp) {
-                if ((request >> 8 & 0xff) == 'T' || (request >> 8 & 0xff) == 'f') { // TIOC... or FIO...
+                if (request == TCGETS) {
+                    memcpy(outbuf, &local_termios, sizeof(struct termios));
+                    out_arglen = sizeof(struct termios);
+                } else if ((request >> 8 & 0xff) == 'T' || (request >> 8 & 0xff) == 'f') { // TIOC... or FIO...
                     int v = local_int;
                     memcpy(outbuf, &v, sizeof(int));
                     out_arglen = sizeof(int);

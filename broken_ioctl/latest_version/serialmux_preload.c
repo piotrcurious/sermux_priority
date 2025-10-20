@@ -677,24 +677,43 @@ int ioctl(int fd, unsigned long request, ...) {
     uint32_t arglen = 0;
     size_t ioctl_size = _IOC_SIZE(request);
 
+    unsigned long dir = _IOC_DIR(request);
+
     if (argp == NULL) {
         arg_type = ARG_NONE;
         arg_data = NULL;
         arglen = 0;
-    } else if (ioctl_size == 0) {
-        arg_type = ARG_VALUE;
-        arg_data = &argp; // Send the value of the pointer itself
-        arglen = sizeof(argp);
     } else {
+        // Default to ARG_BUFFER as it's the most common and safest case for TTY ioctls.
+        // The fatal error is misinterpreting a pointer as a value.
         arg_type = ARG_BUFFER;
         arg_data = argp;
         arglen = (uint32_t)ioctl_size;
+
+        // For old-style ioctls (like TIOCMBIS) or new ioctls with pointer
+        // types, the size can be encoded as 0. We default to sizeof(int)
+        // as this is correct for most modem/control line ioctls.
+        if (arglen == 0 && dir != _IOC_NONE) {
+            arglen = sizeof(int);
+        } else if (dir == _IOC_NONE) {
+            // This case handles legacy ioctls like FIONREAD (0x541B) where
+            // direction info is missing but a pointer argument is expected.
+            arglen = sizeof(int);
+        }
     }
 
     // Output buffer for READ ioctls
-    unsigned char outbuf[4096]; // A reasonably large buffer
+    unsigned char outbuf[4096];
     uint32_t got_len = 0;
     int daemon_errno = 0, out_rc = 0;
+
+    // For read-only ioctls, arg_data points to user memory but may contain
+    // stale data. We send a zeroed buffer to the daemon to prevent issues.
+    unsigned char dummy_buf[arglen];
+    if (dir == _IOC_READ && arglen > 0) {
+        memset(dummy_buf, 0, arglen);
+        arg_data = dummy_buf;
+    }
 
     if (send_request_and_get_response(REQ_IOCTL, (uint64_t)request, arg_type, arg_data, arglen,
                                       &daemon_errno, &out_rc, outbuf, sizeof(outbuf), &got_len) < 0) {

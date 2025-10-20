@@ -362,13 +362,16 @@ static int handle_binary_request(int ctrl_fd) {
 
         unsigned long request = (unsigned long)req64;
         void *argp = NULL;
+
         if (arg_type == ARG_VALUE) {
             memcpy(&argp, arg_buf, sizeof(argp));
+            log_msg("Executing ioctl req=0x%lx (ARG_VALUE), val=%p\n", request, argp);
         } else if (arg_type == ARG_BUFFER) {
             argp = arg_buf;
+            log_msg("Executing ioctl req=0x%lx (ARG_BUFFER), len=%u\n", request, arglen);
+        } else {
+            log_msg("Executing ioctl req=0x%lx (ARG_NONE)\n", request);
         }
-
-        log_msg("Executing ioctl req=0x%lx, arg_type=%d, arglen=%u\n", request, arg_type, arglen);
 
         pthread_mutex_lock(&sp.lock);
         rc = ioctl(sp.real_fd, request, argp);
@@ -515,7 +518,7 @@ void* client_control_thread(void *arg) {
         pthread_mutex_unlock(&sp.lock);
 
         // spawn threads for this client
-        pthread_t relay_tid, ioctl_tid;
+        pthread_t relay_tid;
         int *pidx = malloc(sizeof(int));
         if (!pidx) {
             log_msg("malloc failed for pidx\n");

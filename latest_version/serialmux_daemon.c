@@ -422,9 +422,9 @@ static int handle_binary_request(int ctrl_fd, uid_t peer_uid, pid_t peer_pid) {
             pthread_mutex_lock(&sp.lock);
             int ioctl_ret = ioctl(real_fd, request, argp);
             int saved_errno = (ioctl_ret < 0) ? errno : 0;
-            // if request returns data (e.g. TIOCMGET), copy it out
-            if (ioctl_ret >= 0) {
-                if (request == TIOCMGET && argp) {
+            // if request returns data (e.g. TIOCMGET, FIONREAD), copy it out
+            if (ioctl_ret >= 0 && argp) {
+                if ((request >> 8 & 0xff) == 'T' || (request >> 8 & 0xff) == 'f') { // TIOC... or FIO...
                     int v = local_int;
                     memcpy(outbuf, &v, sizeof(int));
                     out_arglen = sizeof(int);

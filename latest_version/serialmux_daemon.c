@@ -281,7 +281,7 @@ void* pty_ioctl_thread(void *arg) {
             memcpy(&c->current_pty_settings, &new_settings, sizeof(new_settings));
             handle_client_ioctl_settings(client_idx, &new_settings);
         }
-        usleep(50000);
+        usleep(1000);
     }
     handle_client_disconnect(client_idx);
     return NULL;
@@ -571,6 +571,10 @@ void* client_control_thread(void *arg) {
         if (prio == PRIORITY_HIGH) {
             sp.num_high_priority++;
             pause_low_priority_clients();
+            // Flush any stale data from the real serial port
+            if (tcflush(sp.real_fd, TCIOFLUSH) == 0) {
+                log_msg("Flushed serial port for new high-priority client.\n");
+            }
             // Copy current real settings to client's PTY
             save_termios(sp.real_fd, &c->saved_settings);
             restore_termios(c->pty_master_fd, &c->saved_settings);

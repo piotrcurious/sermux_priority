@@ -34,3 +34,52 @@ From the application's perspective, it has a valid file descriptor for the seria
 *   **pthreads:** The daemon uses multiple threads to handle I/O for each client concurrently.
 *   **`select`:** Used for multiplexing I/O from the real serial port, the client PTYs, and the main listening socket.
 *   **`termios` and `ioctl`:** The daemon and preload library work together to forward terminal control operations to the real serial port.
+
+## How to Use (Example with Arduino IDE and Minicom)
+
+This example demonstrates how to use `serialmux` to share a serial port (e.g., `/dev/ttyACM0`) between the Arduino IDE (high priority) and Minicom (low priority).
+
+### 1. Compilation
+
+First, compile the daemon and the preload library using the provided `Makefile`:
+
+```bash
+make
+```
+
+This will create two files: `serialmux_daemon` and `serialmux_preload.so`.
+
+### 2. Run the Daemon
+
+Next, run the daemon and tell it to manage your serial port. For example, if your Arduino is on `/dev/ttyACM0`:
+
+```bash
+./serialmux_daemon /dev/ttyACM0
+```
+
+The daemon will now be running in the background, waiting for clients.
+
+### 3. Run Minicom (Low Priority)
+
+To run Minicom as a low-priority client, you need to use the `LD_PRELOAD` mechanism to load the `serialmux_preload.so` library. You also need to set the `SERIALMUX_DEVICE` environment variable to the path of the serial port you want to open.
+
+```bash
+export SERIALMUX_DEVICE=/dev/ttyACM0
+export LD_PRELOAD=./serialmux_preload.so
+minicom -D $SERIALMUX_DEVICE
+```
+
+Minicom will now be connected to the serial port. You can use it to monitor the output from your Arduino.
+
+### 4. Run Arduino IDE (High Priority)
+
+To run the Arduino IDE as a high-priority client, you need to set the `SERIALMUX_PRIORITY` environment variable to `HIGH`.
+
+```bash
+export SERIALMUX_DEVICE=/dev/ttyACM0
+export SERIALMUX_PRIORITY=HIGH
+export LD_PRELOAD=./serialmux_preload.so
+arduino
+```
+
+When you open the serial monitor in the Arduino IDE, the daemon will detect a high-priority client and pause Minicom. When you close the serial monitor, the daemon will resume Minicom.

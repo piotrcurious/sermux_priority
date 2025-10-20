@@ -4,42 +4,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
-#include <dlfcn.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <pthread.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <termios.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <stdint.h>
 #include <poll.h>
 #include <sys/time.h>
-#include <limits.h>
-#include <sys/sysmacros.h>   /* major/minor */
-#include <sys/syscall.h>     /* SYS_ioctl */
-#include <sys/uio.h>
 
 #define SOCKET_PATH "/tmp/serialmux.sock"
 #define DAEMON_DEVICE_ENV "SERIALMUX_DEVICE"
 #define SERIALMUX_FALLBACK_ENV "SERIALMUX_FALLBACK"
-#define SERIALMUX_DEBUG_ENV "SERIALMUX_DEBUG"
 #define MAX_MAPPED_FDS 1024
 #define CONNECT_TIMEOUT_MS 200
-#define SM_MAGIC "SMIO"
-#define SM_MAGIC_LEN 4
 
-/* Request types */
-enum {
-    REQ_IOCTL = 1,
-    REQ_TCFLSH = 2,
-    REQ_TCSENDBREAK = 3,
-    REQ_TCDRAIN = 4
-};
+#include "serialmux.h"
 
 typedef struct {
     int fd;
@@ -49,15 +36,12 @@ typedef struct {
 static FDMapping fd_map[MAX_MAPPED_FDS];
 static int num_mapped = 0;
 static pthread_mutex_t map_lock = PTHREAD_MUTEX_INITIALIZER;
-static char *target_device = NULL;     /* from env */
-static char resolved_target[PATH_MAX]; /* resolved path for stat */
-static dev_t target_rdev = 0;
+static char *target_device = NULL;
 static int allow_fallback = 0;
-static int debug_enabled = 0;
 
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 
-/* libc function pointers (kept for wrappers where needed) */
+/* libc function pointers */
 static int (*real_open)(const char *, int, ...) = NULL;
 static int (*real_open64)(const char *, int, ...) = NULL;
 static int (*real_openat)(int, const char *, int, ...) = NULL;
@@ -75,9 +59,8 @@ static int (*real_tcflush)(int, int) = NULL;
 static int (*real_tcsendbreak)(int, int) = NULL;
 static int (*real_tcdrain)(int) = NULL;
 
-/* Runtime debug helper (enabled by SERIALMUX_DEBUG=1) */
+/* debug helper */
 static void debug_log(const char *fmt, ...) {
-    if (!debug_enabled) return;
     va_list ap;
     va_start(ap, fmt);
     fprintf(stderr, "SERIALMUX_PRELOAD: ");
@@ -97,7 +80,6 @@ static void add_mapping(int fd) {
         fd_map[num_mapped].fd = fd;
         fd_map[num_mapped].pid = getpid();
         ++num_mapped;
-        debug_log("add_mapping(fd=%d) total=%d", fd, num_mapped);
     } else {
         debug_log("mapping overflow, cannot track fd %d", fd);
     }
@@ -114,7 +96,6 @@ static void remove_mapping(int fd) {
     if (idx != -1) {
         fd_map[idx] = fd_map[num_mapped - 1];
         --num_mapped;
-        debug_log("remove_mapping(fd=%d) total=%d", fd, num_mapped);
     }
     pthread_mutex_unlock(&map_lock);
 }
@@ -201,91 +182,13 @@ static int connect_with_timeout(const struct sockaddr_un *addr, socklen_t addrle
     return -1;
 }
 
-/* send request and read response. returns 0 on IO success, sets out_errno/out_rc/out_arglen.
-   out_buf receives up to out_buf_capacity bytes of returned data.
-*/
-static int send_request_and_get_response(int req_type,
-                                         uint64_t ioctl_req,
-                                         const void *arg, uint32_t arglen,
-                                         int *out_errno,
-                                         void *out_buf, uint32_t out_buf_capacity,
-                                         uint32_t *out_arglen, int *out_rc) {
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+static int send_request(int req_type, int fd, unsigned long request, void *argp);
 
-    int sock = connect_with_timeout(&addr, sizeof(addr), CONNECT_TIMEOUT_MS);
-    if (sock < 0) return -1;
-
-    // send magic
-    if (send_all(sock, SM_MAGIC, SM_MAGIC_LEN) < 0) { close(sock); return -1; }
-
-    // send req type
-    uint32_t t = (uint32_t)req_type;
-    if (send_all(sock, &t, sizeof(t)) < 0) { close(sock); return -1; }
-
-    if (req_type == REQ_IOCTL) {
-        uint64_t r = ioctl_req;
-        if (send_all(sock, &r, sizeof(r)) < 0) { close(sock); return -1; }
-        uint32_t al = arglen;
-        if (send_all(sock, &al, sizeof(al)) < 0) { close(sock); return -1; }
-        if (al > 0) {
-            if (send_all(sock, arg, al) < 0) { close(sock); return -1; }
-        }
-    } else if (req_type == REQ_TCFLSH) {
-        int32_t q = 0;
-        if (arg && arglen >= sizeof(int32_t)) memcpy(&q, arg, sizeof(int32_t));
-        if (send_all(sock, &q, sizeof(q)) < 0) { close(sock); return -1; }
-    } else if (req_type == REQ_TCSENDBREAK) {
-        int32_t dur = 0;
-        if (arg && arglen >= sizeof(int32_t)) memcpy(&dur, arg, sizeof(int32_t));
-        if (send_all(sock, &dur, sizeof(dur)) < 0) { close(sock); return -1; }
-    } else if (req_type == REQ_TCDRAIN) {
-        /* nothing more */
-    } else {
-        close(sock);
-        return -1;
-    }
-
-    int32_t rc = 0;
-    int32_t err_no = 0;
-    uint32_t returned_len = 0;
-
-    if (recv_all(sock, &rc, sizeof(rc)) < 0) { close(sock); return -1; }
-    if (recv_all(sock, &err_no, sizeof(err_no)) < 0) { close(sock); return -1; }
-    if (recv_all(sock, &returned_len, sizeof(returned_len)) < 0) { close(sock); return -1; }
-
-    // read returned bytes (if any)
-    if (returned_len > 0) {
-        if (out_buf && out_buf_capacity > 0) {
-            uint32_t to_copy = (returned_len > out_buf_capacity) ? out_buf_capacity : returned_len;
-            if (recv_all(sock, out_buf, to_copy) < 0) { close(sock); return -1; }
-            // drain remainder
-            uint32_t left = returned_len - to_copy;
-            char drain[256];
-            while (left > 0) {
-                uint32_t chunk = left > sizeof(drain) ? sizeof(drain) : left;
-                if (recv_all(sock, drain, chunk) < 0) { close(sock); return -1; }
-                left -= chunk;
-            }
-        } else {
-            // no buffer provided: drain and discard
-            uint32_t left = returned_len;
-            char drain[256];
-            while (left > 0) {
-                uint32_t chunk = left > sizeof(drain) ? sizeof(drain) : left;
-                if (recv_all(sock, drain, chunk) < 0) { close(sock); return -1; }
-                left -= chunk;
-            }
-        }
-    }
-
-    close(sock);
-    if (out_errno) *out_errno = (int)err_no;
-    if (out_rc) *out_rc = (int)rc;
-    if (out_arglen) *out_arglen = returned_len;
-    return 0;
+/* passthrough ioctl (call libc's ioctl on current fd) */
+static int passthrough_ioctl(int fd, unsigned long request, void *argp) {
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+    if (!real_ioctl) { errno = ENOSYS; return -1; }
+    return real_ioctl(fd, request, argp);
 }
 
 /* init function */
@@ -309,28 +212,9 @@ static void init_once_fn(void) {
     real_tcdrain = dlsym(RTLD_NEXT, "tcdrain");
 
     char *env = getenv(DAEMON_DEVICE_ENV);
-    if (env) {
-        target_device = strdup(env);
-        /* resolve symlink if possible */
-        if (realpath(target_device, resolved_target) == NULL) {
-            /* realpath failed: copy raw path */
-            strncpy(resolved_target, target_device, sizeof(resolved_target) - 1);
-            resolved_target[sizeof(resolved_target) - 1] = '\0';
-        }
-        struct stat st;
-        if (stat(resolved_target, &st) == 0 && S_ISCHR(st.st_mode)) {
-            target_rdev = st.st_rdev;
-            debug_log("Resolved SERIALMUX_DEVICE=%s rdev=%u:%u", resolved_target, (unsigned)major(target_rdev), (unsigned)minor(target_rdev));
-        } else {
-            debug_log("SERIALMUX_DEVICE %s is not a character device or stat failed", resolved_target);
-            target_rdev = 0;
-        }
-    }
+    if (env) target_device = strdup(env);
     char *fb = getenv(SERIALMUX_FALLBACK_ENV);
     if (fb && strcmp(fb, "1") == 0) allow_fallback = 1;
-
-    /* optional runtime debug env */
-    if (getenv(SERIALMUX_DEBUG_ENV)) debug_enabled = 1;
 
     if (!target_device) debug_log("%s unset: preload will not intercept device unless configured", DAEMON_DEVICE_ENV);
 }
@@ -376,34 +260,9 @@ static int connect_and_get_pty(const char *device, char *pty_path_buf, size_t bu
     return 0;
 }
 
-/* passthrough ioctl (call kernel directly via syscall for robustness) */
-static int passthrough_ioctl(int fd, unsigned long request, void *argp) {
-    /* syscall invokes kernel ioctl directly, avoiding dlsym symbol-resolution edge cases */
-    long rc = syscall(SYS_ioctl, fd, request, argp);
-    if (rc == -1) {
-        /* errno set by syscall */
-        return -1;
-    }
-    return (int)rc;
-}
+/* wrapper implementations */
 
-/* Open PTY with retry on ENOENT, for up to ~200ms */
-static int open_pty_with_retry(const char *pty_path, int flags, int need_mode, mode_t mode) {
-    int fd = -1;
-    for (int i = 0; i < 20; i++) {
-        fd = need_mode ? real_open(pty_path, flags, mode) : real_open(pty_path, flags);
-        if (fd >= 0) {
-            break;
-        }
-        if (errno != ENOENT) {
-            break;
-        }
-        usleep(10000);  // 10ms
-    }
-    return fd;
-}
-
-/* wrapper implementations (open/open64/openat/fopen/creat/etc) */
+/* open */
 int open(const char *path, int flags, ...) {
     pthread_once(&init_once, init_once_fn);
 
@@ -423,10 +282,8 @@ int open(const char *path, int flags, ...) {
 
     char pty_path[256];
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
-        int fd = open_pty_with_retry(pty_path, flags, need_mode, mode);
-        if (fd >= 0) {
-            add_mapping(fd);
-        }
+        int fd = need_mode ? real_open(pty_path, flags, mode) : real_open(pty_path, flags);
+        if (fd >= 0) add_mapping(fd);
         return fd;
     }
 
@@ -440,6 +297,7 @@ int open(const char *path, int flags, ...) {
     return -1;
 }
 
+/* open64 */
 int open64(const char *path, int flags, ...) {
     pthread_once(&init_once, init_once_fn);
 
@@ -461,10 +319,8 @@ int open64(const char *path, int flags, ...) {
 
     char pty_path[256];
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
-        int fd = open_pty_with_retry(pty_path, flags, need_mode, mode);
-        if (fd >= 0) {
-            add_mapping(fd);
-        }
+        int fd = need_mode ? real_open64(pty_path, flags, mode) : real_open(pty_path, flags);
+        if (fd >= 0) add_mapping(fd);
         return fd;
     }
 
@@ -482,6 +338,7 @@ int open64(const char *path, int flags, ...) {
     return -1;
 }
 
+/* openat */
 int openat(int dirfd, const char *path, int flags, ...) {
     pthread_once(&init_once, init_once_fn);
 
@@ -503,10 +360,8 @@ int openat(int dirfd, const char *path, int flags, ...) {
 
     char pty_path[256];
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
-        int fd = open_pty_with_retry(pty_path, flags, need_mode, mode);
-        if (fd >= 0) {
-            add_mapping(fd);
-        }
+        int fd = need_mode ? real_open(pty_path, flags, mode) : real_open(pty_path, flags);
+        if (fd >= 0) add_mapping(fd);
         return fd;
     }
 
@@ -546,7 +401,7 @@ FILE *fopen(const char *path, const char *mode_str) {
     char pty_path[256];
     if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
         int flags = fopen_mode_to_flags(mode_str);
-        int fd = open_pty_with_retry(pty_path, flags, (flags & O_CREAT) != 0, 0666);
+        int fd = real_open(pty_path, flags, 0666);
         if (fd < 0) {
             if (allow_fallback) {
                 int fd2 = real_open(path, flags, 0666);
@@ -584,10 +439,15 @@ FILE *freopen(const char *path, const char *mode_str, FILE *stream) {
         errno = EINVAL;
         return NULL;
     }
-    int oldfd = fileno(stream);
-    if (oldfd >= 0) remove_mapping(oldfd);
-    if (real_fclose) real_fclose(stream);
-    else fclose(stream);
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wnonnull-compare"
+    if (stream) {
+        int oldfd = fileno(stream);
+        if (oldfd >= 0) remove_mapping(oldfd);
+        if (real_fclose) real_fclose(stream);
+        else fclose(stream);
+    }
+    #pragma GCC diagnostic pop
     return fopen(path, mode_str);
 }
 
@@ -648,130 +508,152 @@ int fcntl(int fd, int cmd, ...) {
     return real_fcntl(fd, cmd, arg);
 }
 
-
-
+/* ioctl wrapper: forward ioctls to daemon when fd mapped */
 int ioctl(int fd, unsigned long request, ...) {
     pthread_once(&init_once, init_once_fn);
-
-    void *argp = NULL;
     va_list ap;
     va_start(ap, request);
-    argp = va_arg(ap, void *);
+    void *argp = va_arg(ap, void*);
     va_end(ap);
 
-    if (!is_mapped(fd)) {
-        return passthrough_ioctl(fd, request, argp);
-    }
-
-    if (!isatty(fd)) {
-        debug_log("passthrough ioctl on non-tty fd=%d req=0x%lx", fd, request);
-        return passthrough_ioctl(fd, request, argp);
-    }
-
-    debug_log("forwarding ioctl fd=%d req=0x%lx", fd, request);
-
-    size_t size = _IOC_SIZE(request);
-    unsigned char argbuf[4096];
-    uint32_t arglen = 0;
-
-    if (argp && size > 0) {
-        arglen = (size > sizeof(argbuf)) ? sizeof(argbuf) : size;
-        if ((_IOC_DIR(request) & _IOC_WRITE)) {
-            memcpy(argbuf, argp, arglen);
-        }
-    }
-
-    unsigned char outbuf[4096];
-    uint32_t got_len = 0;
-    int daemon_errno = 0, out_rc = 0;
-
-    if (send_request_and_get_response(REQ_IOCTL, (uint64_t)request, argbuf, arglen, &daemon_errno, outbuf, sizeof(outbuf), &got_len, &out_rc) < 0) {
-        if (allow_fallback) {
-            return passthrough_ioctl(fd, request, argp);
-        }
-        errno = EIO;
-        return -1;
-    }
-
-    if (out_rc < 0) {
-        errno = daemon_errno;
-        return -1;
-    }
-
-    if (argp && got_len > 0 && (_IOC_DIR(request) & _IOC_READ)) {
-        size_t to_copy = (got_len > size) ? size : got_len;
-        memcpy(argp, outbuf, to_copy);
-    }
-
-    return out_rc;
+    return send_request(REQ_IOCTL, fd, request, argp);
 }
 
 /* tcflush wrapper */
 int tcflush(int fd, int queue_selector) {
     pthread_once(&init_once, init_once_fn);
-    if (!is_mapped(fd)) {
-        return real_tcflush(fd, queue_selector);
-    }
-
-    int arg = queue_selector;
-    int daemon_errno = 0, out_rc = 0;
-    if (send_request_and_get_response(REQ_TCFLSH, 0, &arg, sizeof(arg), &daemon_errno, NULL, 0, NULL, &out_rc) < 0) {
-        if (allow_fallback) {
-            return real_tcflush(fd, queue_selector);
-        }
-        errno = EIO;
-        return -1;
-    }
-    if (out_rc < 0) {
-        errno = daemon_errno;
-        return -1;
-    }
-    return out_rc;
+    return send_request(REQ_TCFLSH, fd, 0, &queue_selector);
 }
 
 /* tcsendbreak wrapper */
 int tcsendbreak(int fd, int duration) {
     pthread_once(&init_once, init_once_fn);
-    if (!is_mapped(fd)) {
-        return real_tcsendbreak(fd, duration);
-    }
-
-    int arg = duration;
-    int daemon_errno = 0, out_rc = 0;
-    if (send_request_and_get_response(REQ_TCSENDBREAK, 0, &arg, sizeof(arg), &daemon_errno, NULL, 0, NULL, &out_rc) < 0) {
-        if (allow_fallback) {
-            return real_tcsendbreak(fd, duration);
-        }
-        errno = EIO;
-        return -1;
-    }
-    if (out_rc < 0) {
-        errno = daemon_errno;
-        return -1;
-    }
-    return out_rc;
+    return send_request(REQ_TCSENDBREAK, fd, 0, &duration);
 }
 
 /* tcdrain wrapper */
 int tcdrain(int fd) {
     pthread_once(&init_once, init_once_fn);
-    if (!is_mapped(fd)) {
-        return real_tcdrain(fd);
+    return send_request(REQ_TCDRAIN, fd, 0, NULL);
+}
+
+static int send_request(int req_type, int fd, unsigned long request, void *argp) {
+    if (!is_mapped(fd) || !isatty(fd)) {
+        if (req_type == REQ_IOCTL) return passthrough_ioctl(fd, request, argp);
+        if (req_type == REQ_TCFLSH) return real_tcflush(fd, *(int*)argp);
+        if (req_type == REQ_TCSENDBREAK) return real_tcsendbreak(fd, *(int*)argp);
+        if (req_type == REQ_TCDRAIN) return real_tcdrain(fd);
+        errno = EINVAL;
+        return -1;
     }
 
-    int daemon_errno = 0, out_rc = 0;
-    if (send_request_and_get_response(REQ_TCDRAIN, 0, NULL, 0, &daemon_errno, NULL, 0, NULL, &out_rc) < 0) {
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    int sock = connect_with_timeout(&addr, sizeof(addr), CONNECT_TIMEOUT_MS);
+    if (sock < 0) {
         if (allow_fallback) {
-            return real_tcdrain(fd);
+            if (req_type == REQ_IOCTL) return passthrough_ioctl(fd, request, argp);
+            if (req_type == REQ_TCFLSH) return real_tcflush(fd, *(int*)argp);
+            if (req_type == REQ_TCSENDBREAK) return real_tcsendbreak(fd, *(int*)argp);
+            if (req_type == REQ_TCDRAIN) return real_tcdrain(fd);
         }
         errno = EIO;
         return -1;
     }
-    if (out_rc < 0) {
-        errno = daemon_errno;
+
+    struct sm_header hdr;
+    memcpy(hdr.magic, SM_MAGIC, sizeof(SM_MAGIC));
+    hdr.type = req_type;
+    hdr.payload_len = 0;
+
+    struct sm_ioctl_req ioctl_req;
+    if (req_type == REQ_IOCTL) {
+        ioctl_req.request = request;
+        size_t arg_size = _IOC_SIZE(request);
+        int dir = _IOC_DIR(request);
+
+        switch (request) {
+            case TIOCMBIS:
+            case TIOCMBIC:
+            case TIOCMSET:
+                ioctl_req.arg_type = ARG_VALUE;
+                ioctl_req.arg_len = sizeof(int);
+                hdr.payload_len = sizeof(ioctl_req) + sizeof(int);
+                break;
+            default:
+                if (argp && (dir & _IOC_WRITE)) {
+                    ioctl_req.arg_type = ARG_BUFFER;
+                    ioctl_req.arg_len = arg_size;
+                    hdr.payload_len = sizeof(ioctl_req) + ioctl_req.arg_len;
+                } else {
+                    ioctl_req.arg_type = ARG_NONE;
+                    ioctl_req.arg_len = 0;
+                    hdr.payload_len = sizeof(ioctl_req);
+                }
+                break;
+        }
+    }
+
+    if (send_all(sock, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+        close(sock);
+        errno = EIO;
         return -1;
     }
-    return out_rc;
-}
 
-/* End of file */
+    if (req_type == REQ_IOCTL) {
+        if (send_all(sock, &ioctl_req, sizeof(ioctl_req)) != sizeof(ioctl_req)) {
+            close(sock);
+            errno = EIO;
+            return -1;
+        }
+        if (ioctl_req.arg_type == ARG_BUFFER && ioctl_req.arg_len > 0) {
+            if (send_all(sock, argp, ioctl_req.arg_len) != (ssize_t)ioctl_req.arg_len) {
+                close(sock);
+                errno = EIO;
+                return -1;
+            }
+        } else if (ioctl_req.arg_type == ARG_VALUE) {
+            int val = (int)(intptr_t)argp;
+            if (send_all(sock, &val, sizeof(int)) != sizeof(int)) {
+                close(sock);
+                errno = EIO;
+                return -1;
+            }
+        }
+    } else {
+        if (argp != NULL) {
+             if (send_all(sock, argp, sizeof(int)) != sizeof(int)) {
+                close(sock);
+                errno = EIO;
+                return -1;
+            }
+        }
+    }
+
+    struct sm_response resp;
+    if (recv_all(sock, &resp, sizeof(resp)) != sizeof(resp)) {
+        close(sock);
+        errno = EIO;
+        return -1;
+    }
+
+    if (resp.rc < 0) {
+        errno = resp.errno_val;
+        close(sock);
+        return -1;
+    }
+
+    if (resp.payload_len > 0 && argp) {
+        if (recv_all(sock, argp, resp.payload_len) != (ssize_t)resp.payload_len) {
+            close(sock);
+            errno = EIO;
+            return -1;
+        }
+    }
+
+    close(sock);
+    return resp.rc;
+}

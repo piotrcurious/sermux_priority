@@ -27,14 +27,7 @@
 #define MAX_CLIENTS 10
 #define BUF_SIZE 4096
 
-/* Binary protocol magic + request types (match preload) */
-static const char SM_MAGIC[4] = { 'S', 'M', 'I', 'O' };
-enum {
-    REQ_IOCTL = 1,
-    REQ_TCFLSH = 2,
-    REQ_TCSENDBREAK = 3,
-    REQ_TCDRAIN = 4
-};
+#include "serialmux.h"
 
 typedef enum { PRIORITY_LOW = 0, PRIORITY_HIGH = 1 } Priority;
 
@@ -44,8 +37,6 @@ typedef struct {
     pid_t pid;               // pid reported by client (text open) or 0
     Priority priority;
     int pty_master_fd;
-    struct termios saved_settings;       // The settings this client *wants*
-    struct termios current_pty_settings; // The last-seen settings on its PTY
 } Client;
 
 typedef struct {
@@ -174,72 +165,6 @@ void restore_termios(int fd, struct termios *t) {
     }
 }
 
-/* Manage low-priority saves and pause/resume */
-void update_low_priority_saves(struct termios *new_settings) {
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (sp.clients[i].active && sp.clients[i].priority == PRIORITY_LOW) {
-            memcpy(&sp.clients[i].saved_settings, new_settings, sizeof(struct termios));
-        }
-    }
-    memcpy(&sp.current_settings, new_settings, sizeof(struct termios));
-}
-
-void pause_low_priority_clients() {
-    log_msg("High priority client active. Pausing low priority clients.\n");
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (sp.clients[i].active && sp.clients[i].priority == PRIORITY_LOW) {
-            sp.clients[i].paused = 1;
-            log_msg("Paused low priority client PID %d\n", sp.clients[i].pid);
-        }
-    }
-}
-
-void resume_low_priority_clients() {
-    log_msg("Last high priority client disconnected. Resuming low priority clients.\n");
-    int last_low_prio_idx = -1;
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (sp.clients[i].active && sp.clients[i].priority == PRIORITY_LOW) {
-            last_low_prio_idx = i;
-        }
-    }
-    if (last_low_prio_idx != -1) {
-        log_msg("Restoring settings from PID %d\n", sp.clients[last_low_prio_idx].pid);
-        restore_termios(sp.real_fd, &sp.clients[last_low_prio_idx].saved_settings);
-        save_termios(sp.real_fd, &sp.current_settings);
-    }
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (sp.clients[i].active && sp.clients[i].priority == PRIORITY_LOW) {
-            sp.clients[i].paused = 0;
-            log_msg("Resumed low priority client PID %d\n", sp.clients[i].pid);
-        }
-    }
-}
-
-/* handle termios changes from PTY */
-void handle_client_ioctl_settings(int client_idx, struct termios *new_settings) {
-    pthread_mutex_lock(&sp.lock);
-    Client *c = &sp.clients[client_idx];
-    if (!c->active) {
-        pthread_mutex_unlock(&sp.lock);
-        return;
-    }
-    if (c->priority == PRIORITY_HIGH) {
-        restore_termios(sp.real_fd, new_settings);
-        update_low_priority_saves(new_settings);
-        log_msg("High priority PID %d applied new termios settings\n", c->pid);
-    } else {
-        memcpy(&c->saved_settings, new_settings, sizeof(struct termios));
-        if (c->paused) {
-            log_msg("Low priority PID %d termios settings saved (paused)\n", c->pid);
-        } else {
-            restore_termios(sp.real_fd, new_settings);
-            save_termios(sp.real_fd, &sp.current_settings);
-            log_msg("Low priority PID %d applied new termios settings\n", c->pid);
-        }
-    }
-    pthread_mutex_unlock(&sp.lock);
-}
-
 /* client disconnect cleanup */
 void handle_client_disconnect(int client_idx) {
     pthread_mutex_lock(&sp.lock);
@@ -257,34 +182,8 @@ void handle_client_disconnect(int client_idx) {
     c->paused = 0;
     if (c->priority == PRIORITY_HIGH) {
         sp.num_high_priority--;
-        if (sp.num_high_priority <= 0) {
-            sp.num_high_priority = 0;
-            resume_low_priority_clients();
-        }
     }
     pthread_mutex_unlock(&sp.lock);
-}
-
-/* pty ioctl polling thread */
-void* pty_ioctl_thread(void *arg) {
-    int client_idx = *(int*)arg;
-    free(arg);
-    Client *c = &sp.clients[client_idx];
-
-    while (running && c->active) {
-        struct termios new_settings;
-        if (tcgetattr(c->pty_master_fd, &new_settings) < 0) {
-            // PTY closed or error
-            break;
-        }
-        if (memcmp(&c->current_pty_settings, &new_settings, sizeof(new_settings)) != 0) {
-            memcpy(&c->current_pty_settings, &new_settings, sizeof(new_settings));
-            handle_client_ioctl_settings(client_idx, &new_settings);
-        }
-        usleep(1000);
-    }
-    handle_client_disconnect(client_idx);
-    return NULL;
 }
 
 /* pty data relay thread */
@@ -330,13 +229,14 @@ void* pty_relay_thread(void *arg) {
             if (!paused) {
                 ssize_t n = read(real_fd, buf, sizeof(buf));
                 if (n > 0) {
-                    robust_write(pty_fd, buf, n);
+                    ssize_t w = write(pty_fd, buf, n);
+                    (void)w;
                 } else if (n == 0) {
-                    log_msg("Real serial port hangup (read=0). Terminating relay for client %d.\n", client_idx);
+                    log_msg("Real serial port hung up. Terminating relay for client %d.\n", c->pid);
                     break;
-                } else {
-                    log_msg("Real serial port error (read=%zd). Stopping daemon.\n", n);
-                    running = 0; // Fatal error
+                }
+                else {
+                    log_msg("Real serial port error (read=%zd). Terminating relay for client %d.\n", n, c->pid);
                     break;
                 }
             }
@@ -369,133 +269,86 @@ void* pty_relay_thread(void *arg) {
 }
 
 /* ---------- Binary control handling (SMIO protocol) ---------- */
+static int handle_binary_request(int ctrl_fd) {
+    struct sm_header hdr;
+    if (robust_read_all(ctrl_fd, &hdr, sizeof(hdr)) != sizeof(hdr)) return -1;
 
-/* Validate magic and read request header/payload then perform requested action.
-   Response format:
-     int32_t rc;
-     int32_t errno_val;
-     uint32_t out_arglen;
-     bytes[out_arglen]
-*/
-static int handle_binary_request(int ctrl_fd, uid_t peer_uid, pid_t peer_pid) {
-    // Read magic
-    char magic[4];
-    if (robust_read_all(ctrl_fd, magic, sizeof(magic)) != (ssize_t)sizeof(magic)) return -1;
-    if (memcmp(magic, SM_MAGIC, sizeof(magic)) != 0) return -1;
+    if (memcmp(hdr.magic, SM_MAGIC, sizeof(SM_MAGIC)) != 0) {
+        log_msg("Invalid magic number\n");
+        return -1;
+    }
 
-    uint32_t req_type;
-    if (robust_read_all(ctrl_fd, &req_type, sizeof(req_type)) != (ssize_t)sizeof(req_type)) return -1;
+    struct sm_response resp = {0};
+    void* payload = NULL;
 
-    // We'll hold sp.lock when calling ioctls/tc* to ensure consistency
-    int32_t rc = -1;
-    int32_t err_no = 0;
-    uint32_t out_arglen = 0;
-    unsigned char outbuf[64] = {0};
+    if (hdr.payload_len > 0) {
+        payload = malloc(hdr.payload_len);
+        if (!payload) {
+            resp.rc = -1;
+            resp.errno_val = ENOMEM;
+            robust_write(ctrl_fd, &resp, sizeof(resp));
+            return -1;
+        }
+        if (robust_read_all(ctrl_fd, payload, hdr.payload_len) != (ssize_t)hdr.payload_len) {
+            free(payload);
+            return -1;
+        }
+    }
 
     pthread_mutex_lock(&sp.lock);
     int real_fd = sp.real_fd;
     pthread_mutex_unlock(&sp.lock);
 
-    switch (req_type) {
+    switch (hdr.type) {
         case REQ_IOCTL: {
-            uint64_t req64 = 0;
-            if (robust_read_all(ctrl_fd, &req64, sizeof(req64)) != (ssize_t)sizeof(req64)) { err_no = EIO; break; }
-            uint32_t arglen = 0;
-            if (robust_read_all(ctrl_fd, &arglen, sizeof(arglen)) != (ssize_t)sizeof(arglen)) { err_no = EIO; break; }
-            if (arglen > 64) { err_no = EINVAL; break; } // too large
-            unsigned char argbuf[64];
-            if (arglen > 0) {
-                if (robust_read_all(ctrl_fd, argbuf, arglen) != (ssize_t)arglen) { err_no = EIO; break; }
-            }
-            unsigned long request = (unsigned long)req64;
+            struct sm_ioctl_req *req = payload;
             void *argp = NULL;
-            struct termios local_termios;
-            int local_int = 0;
-
-            if (request == TCGETS) {
-                argp = &local_termios;
-            } else if (arglen > 0) {
-                if (arglen == sizeof(struct termios) && (request == TCSETS || request == TCSETSW || request == TCSETSF)) {
-                    memcpy(&local_termios, argbuf, sizeof(struct termios));
-                    argp = &local_termios;
-                } else if (arglen >= sizeof(int)) {
-                    memcpy(&local_int, argbuf, sizeof(int));
-                    argp = &local_int;
-                }
+            int value;
+            if (req->arg_type == ARG_BUFFER) {
+                argp = (void*)((char*)payload + sizeof(struct sm_ioctl_req));
+            } else if (req->arg_type == ARG_VALUE) {
+                memcpy(&value, (char*)payload + sizeof(struct sm_ioctl_req), sizeof(int));
+                argp = &value;
             }
 
-            // perform ioctl under lock
-            pthread_mutex_lock(&sp.lock);
-            int ioctl_ret = ioctl(real_fd, request, argp);
-            int saved_errno = (ioctl_ret < 0) ? errno : 0;
-            if (ioctl_ret >= 0 && argp) {
-                if (request == TCGETS) {
-                    memcpy(outbuf, &local_termios, sizeof(struct termios));
-                    out_arglen = sizeof(struct termios);
-                } else if (_IOC_DIR(request) & _IOC_READ) {
-                    int v = local_int;
-                    memcpy(outbuf, &v, sizeof(int));
-                    out_arglen = sizeof(int);
-                }
-            }
-            pthread_mutex_unlock(&sp.lock);
+            resp.rc = ioctl(real_fd, req->request, argp);
+            resp.errno_val = (resp.rc < 0) ? errno : 0;
 
-            if (ioctl_ret < 0) {
-                rc = -1;
-                err_no = saved_errno;
-            } else {
-                rc = ioctl_ret;
-                err_no = 0;
+            if (resp.rc >= 0 && req->arg_type == ARG_BUFFER && (_IOC_DIR(req->request) & _IOC_READ)) {
+                resp.payload_len = req->arg_len;
             }
             break;
         }
-        case REQ_TCFLSH: {
-            int32_t sel = 0;
-            if (robust_read_all(ctrl_fd, &sel, sizeof(sel)) != (ssize_t)sizeof(sel)) { err_no = EIO; break; }
-            pthread_mutex_lock(&sp.lock);
-            int tret = tcflush(sp.real_fd, sel);
-            int saved_errno = (tret < 0) ? errno : 0;
-            pthread_mutex_unlock(&sp.lock);
-            if (tret < 0) { rc = -1; err_no = saved_errno; }
-            else { rc = 0; err_no = 0; }
-            break;
-        }
+        case REQ_TCFLSH:
         case REQ_TCSENDBREAK: {
-            int32_t dur = 0;
-            if (robust_read_all(ctrl_fd, &dur, sizeof(dur)) != (ssize_t)sizeof(dur)) { err_no = EIO; break; }
-            pthread_mutex_lock(&sp.lock);
-            int tret = tcsendbreak(sp.real_fd, dur);
-            int saved_errno = (tret < 0) ? errno : 0;
-            pthread_mutex_unlock(&sp.lock);
-            if (tret < 0) { rc = -1; err_no = saved_errno; }
-            else { rc = 0; err_no = 0; }
+            int arg = *(int*)payload;
+            if (hdr.type == REQ_TCFLSH) {
+                resp.rc = tcflush(real_fd, arg);
+            } else {
+                resp.rc = tcsendbreak(real_fd, arg);
+            }
+            resp.errno_val = (resp.rc < 0) ? errno : 0;
             break;
         }
-        case REQ_TCDRAIN: {
-            pthread_mutex_lock(&sp.lock);
-            int tret = tcdrain(sp.real_fd);
-            int saved_errno = (tret < 0) ? errno : 0;
-            pthread_mutex_unlock(&sp.lock);
-            if (tret < 0) { rc = -1; err_no = saved_errno; }
-            else { rc = 0; err_no = 0; }
+        case REQ_TCDRAIN:
+            resp.rc = tcdrain(real_fd);
+            resp.errno_val = (resp.rc < 0) ? errno : 0;
             break;
-        }
         default:
-            err_no = ENOSYS;
-            rc = -1;
+            resp.rc = -1;
+            resp.errno_val = ENOSYS;
             break;
     }
 
-    // send response header and optional outbuf
-    // Use robust_write for safety
-    if (robust_write(ctrl_fd, &rc, sizeof(rc)) < 0) return -1;
-    if (robust_write(ctrl_fd, &err_no, sizeof(err_no)) < 0) return -1;
-    if (robust_write(ctrl_fd, &out_arglen, sizeof(out_arglen)) < 0) return -1;
-    if (out_arglen > 0) {
-        if (robust_write(ctrl_fd, outbuf, out_arglen) < 0) return -1;
+    robust_write(ctrl_fd, &resp, sizeof(resp));
+    if (resp.payload_len > 0) {
+        robust_write(ctrl_fd, (void*)((char*)payload + sizeof(struct sm_ioctl_req)), resp.payload_len);
     }
+
+    if (payload) free(payload);
     return 0;
 }
+
 
 /* control thread: accept either text commands (OPEN/CLOSE) or binary SMIO requests.
    Uses MSG_PEEK to detect binary magic without consuming it.
@@ -504,14 +357,11 @@ void* client_control_thread(void *arg) {
     int client_fd = *(int*)arg;
     free(arg);
 
-    // Peek 4 bytes to detect SMIO binary magic
-    char peek[4];
-    ssize_t p = recv(client_fd, peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT);
-    if (p == (ssize_t)sizeof(peek) && memcmp(peek, SM_MAGIC, sizeof(peek)) == 0) {
-        // handle binary request (handle_binary_request will read the magic itself)
-        uid_t peer_uid = (uid_t)-1;
-        pid_t peer_pid = (pid_t)-1;
-        handle_binary_request(client_fd, peer_uid, peer_pid);
+    // Peek to detect SMIO binary magic
+    char magic_peek[4];
+    ssize_t p = recv(client_fd, &magic_peek, sizeof(magic_peek), MSG_PEEK | MSG_DONTWAIT);
+    if (p == (ssize_t)sizeof(magic_peek) && memcmp(magic_peek, SM_MAGIC, sizeof(SM_MAGIC)) == 0) {
+        handle_binary_request(client_fd);
         close(client_fd);
         return NULL;
     }
@@ -577,30 +427,14 @@ void* client_control_thread(void *arg) {
         c->priority = prio;
         c->pty_master_fd = pty_master;
         c->paused = 0;
-        save_termios(c->pty_master_fd, &c->current_pty_settings);
 
-        if (prio == PRIORITY_HIGH) {
-            sp.num_high_priority++;
-            pause_low_priority_clients();
-            // Flush any stale data from the real serial port
-            if (tcflush(sp.real_fd, TCIOFLUSH) == 0) {
-                log_msg("Flushed serial port for new high-priority client.\n");
-            }
-            // Copy current real settings to client's PTY
-            save_termios(sp.real_fd, &c->saved_settings);
-            restore_termios(c->pty_master_fd, &c->saved_settings);
-            memcpy(&c->current_pty_settings, &c->saved_settings, sizeof(struct termios));
-        } else {
-            save_termios(sp.real_fd, &c->saved_settings);
-            if (sp.num_high_priority > 0) {
-                c->paused = 1;
-                log_msg("Low priority client PID %d connected (paused)\n", (int)c->pid);
-            }
-        }
+        // Apply current settings to the new PTY
+        restore_termios(c->pty_master_fd, &sp.current_settings);
+
         pthread_mutex_unlock(&sp.lock);
 
         // spawn threads for this client
-        pthread_t relay_tid, ioctl_tid;
+        pthread_t relay_tid;
         int *pidx = malloc(sizeof(int));
         if (!pidx) {
             log_msg("malloc failed for pidx\n");
@@ -619,23 +453,6 @@ void* client_control_thread(void *arg) {
             return NULL;
         }
         pthread_detach(relay_tid);
-
-        int *pidx2 = malloc(sizeof(int));
-        if (!pidx2) {
-            log_msg("malloc failed for pidx2\n");
-            handle_client_disconnect(idx);
-            close(client_fd);
-            return NULL;
-        }
-        *pidx2 = idx;
-        if (pthread_create(&ioctl_tid, NULL, pty_ioctl_thread, pidx2) != 0) {
-            log_msg("pthread_create ioctl failed\n");
-            handle_client_disconnect(idx);
-            free(pidx2);
-            close(client_fd);
-            return NULL;
-        }
-        pthread_detach(ioctl_tid);
 
     } else if (strncmp(buf, "CLOSE:", 6) == 0) {
         pid_t pid = (pid_t)atoi(buf + 6);

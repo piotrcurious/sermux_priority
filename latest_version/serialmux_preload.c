@@ -25,8 +25,16 @@
 #define SERIALMUX_FALLBACK_ENV "SERIALMUX_FALLBACK"
 #define MAX_MAPPED_FDS 1024
 #define CONNECT_TIMEOUT_MS 200
+#define SM_MAGIC "SMIO"
+#define SM_MAGIC_LEN 4
 
-#include "serialmux.h"
+/* Request types */
+enum {
+    REQ_IOCTL = 1,
+    REQ_TCFLSH = 2,
+    REQ_TCSENDBREAK = 3,
+    REQ_TCDRAIN = 4
+};
 
 typedef struct {
     int fd;
@@ -182,13 +190,91 @@ static int connect_with_timeout(const struct sockaddr_un *addr, socklen_t addrle
     return -1;
 }
 
-static int send_request(int req_type, int fd, unsigned long request, void *argp);
+/* send request and read response. returns 0 on IO success, sets out_errno/out_rc/out_arglen.
+   out_buf receives up to out_buf_capacity bytes of returned data.
+*/
+static int send_request_and_get_response(int req_type,
+                                         uint64_t ioctl_req,
+                                         const void *arg, uint32_t arglen,
+                                         int *out_errno,
+                                         void *out_buf, uint32_t out_buf_capacity,
+                                         uint32_t *out_arglen, int *out_rc) {
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
-/* passthrough ioctl (call libc's ioctl on current fd) */
-static int passthrough_ioctl(int fd, unsigned long request, void *argp) {
-    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
-    if (!real_ioctl) { errno = ENOSYS; return -1; }
-    return real_ioctl(fd, request, argp);
+    int sock = connect_with_timeout(&addr, sizeof(addr), CONNECT_TIMEOUT_MS);
+    if (sock < 0) return -1;
+
+    // send magic
+    if (send_all(sock, SM_MAGIC, SM_MAGIC_LEN) < 0) { close(sock); return -1; }
+
+    // send req type
+    uint32_t t = (uint32_t)req_type;
+    if (send_all(sock, &t, sizeof(t)) < 0) { close(sock); return -1; }
+
+    if (req_type == REQ_IOCTL) {
+        uint64_t r = ioctl_req;
+        if (send_all(sock, &r, sizeof(r)) < 0) { close(sock); return -1; }
+        uint32_t al = arglen;
+        if (send_all(sock, &al, sizeof(al)) < 0) { close(sock); return -1; }
+        if (al > 0) {
+            if (send_all(sock, arg, al) < 0) { close(sock); return -1; }
+        }
+    } else if (req_type == REQ_TCFLSH) {
+        int32_t q = 0;
+        if (arg && arglen >= sizeof(int32_t)) memcpy(&q, arg, sizeof(int32_t));
+        if (send_all(sock, &q, sizeof(q)) < 0) { close(sock); return -1; }
+    } else if (req_type == REQ_TCSENDBREAK) {
+        int32_t dur = 0;
+        if (arg && arglen >= sizeof(int32_t)) memcpy(&dur, arg, sizeof(int32_t));
+        if (send_all(sock, &dur, sizeof(dur)) < 0) { close(sock); return -1; }
+    } else if (req_type == REQ_TCDRAIN) {
+        /* nothing more */
+    } else {
+        close(sock);
+        return -1;
+    }
+
+    int32_t rc = 0;
+    int32_t err_no = 0;
+    uint32_t returned_len = 0;
+
+    if (recv_all(sock, &rc, sizeof(rc)) < 0) { close(sock); return -1; }
+    if (recv_all(sock, &err_no, sizeof(err_no)) < 0) { close(sock); return -1; }
+    if (recv_all(sock, &returned_len, sizeof(returned_len)) < 0) { close(sock); return -1; }
+
+    // read returned bytes (if any)
+    if (returned_len > 0) {
+        if (out_buf && out_buf_capacity > 0) {
+            uint32_t to_copy = (returned_len > out_buf_capacity) ? out_buf_capacity : returned_len;
+            if (recv_all(sock, out_buf, to_copy) < 0) { close(sock); return -1; }
+            // drain remainder
+            uint32_t left = returned_len - to_copy;
+            char drain[256];
+            while (left > 0) {
+                uint32_t chunk = left > sizeof(drain) ? sizeof(drain) : left;
+                if (recv_all(sock, drain, chunk) < 0) { close(sock); return -1; }
+                left -= chunk;
+            }
+        } else {
+            // no buffer provided: drain and discard
+            uint32_t left = returned_len;
+            char drain[256];
+            while (left > 0) {
+                uint32_t chunk = left > sizeof(drain) ? sizeof(drain) : left;
+                if (recv_all(sock, drain, chunk) < 0) { close(sock); return -1; }
+                left -= chunk;
+            }
+        }
+    }
+
+    close(sock);
+    if (out_errno) *out_errno = (int)err_no;
+    if (out_rc) *out_rc = (int)rc;
+    if (out_arglen) *out_arglen = returned_len;
+    return 0;
 }
 
 /* init function */
@@ -258,6 +344,13 @@ static int connect_and_get_pty(const char *device, char *pty_path_buf, size_t bu
     pty_path_buf[n] = '\0';
     if (strncmp(pty_path_buf, "ERROR:", 6) == 0) return -1;
     return 0;
+}
+
+/* passthrough ioctl (call libc's ioctl on current fd) */
+static int passthrough_ioctl(int fd, unsigned long request, void *argp) {
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+    if (!real_ioctl) { errno = ENOSYS; return -1; }
+    return real_ioctl(fd, request, argp);
 }
 
 /* wrapper implementations */
@@ -439,15 +532,12 @@ FILE *freopen(const char *path, const char *mode_str, FILE *stream) {
         errno = EINVAL;
         return NULL;
     }
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wnonnull-compare"
     if (stream) {
         int oldfd = fileno(stream);
         if (oldfd >= 0) remove_mapping(oldfd);
         if (real_fclose) real_fclose(stream);
         else fclose(stream);
     }
-    #pragma GCC diagnostic pop
     return fopen(path, mode_str);
 }
 
@@ -508,158 +598,141 @@ int fcntl(int fd, int cmd, ...) {
     return real_fcntl(fd, cmd, arg);
 }
 
-/* ioctl wrapper: forward ioctls to daemon when fd mapped */
+/* ioctl wrapper: forward modem ioctls to daemon when fd mapped */
 int ioctl(int fd, unsigned long request, ...) {
     pthread_once(&init_once, init_once_fn);
+
     va_list ap;
+    void *argp;
     va_start(ap, request);
-    void *argp = va_arg(ap, void*);
+    argp = va_arg(ap, void *);
     va_end(ap);
 
-    return send_request(REQ_IOCTL, fd, request, argp);
+    if (!is_mapped(fd)) {
+        return passthrough_ioctl(fd, request, argp);
+    }
+
+    switch (request) {
+#ifdef TIOCMGET
+        case TIOCMGET:
+#endif
+#ifdef TIOCMSET
+        case TIOCMSET:
+#endif
+#ifdef TIOCMBIS
+        case TIOCMBIS:
+#endif
+#ifdef TIOCMBIC
+        case TIOCMBIC:
+#endif
+#ifdef TIOCSBRK
+        case TIOCSBRK:
+#endif
+#ifdef TIOCCBRK
+        case TIOCCBRK:
+#endif
+            break;
+        default:
+            return passthrough_ioctl(fd, request, argp);
+    }
+
+    unsigned char argbuf[64];
+    uint32_t arglen = 0;
+    if (argp) {
+        if (sizeof(int) <= sizeof(argbuf)) {
+            memcpy(argbuf, argp, sizeof(int));
+            arglen = sizeof(int);
+        } else {
+            return passthrough_ioctl(fd, request, argp);
+        }
+    }
+
+    unsigned char outbuf[64];
+    uint32_t got_len = 0;
+    int daemon_errno = 0, out_rc = 0;
+    if (send_request_and_get_response(REQ_IOCTL, (uint64_t)request, argbuf, arglen, &daemon_errno, outbuf, sizeof(outbuf), &got_len, &out_rc) < 0) {
+        if (allow_fallback) return passthrough_ioctl(fd, request, argp);
+        errno = EIO; return -1;
+    }
+
+    if (out_rc < 0) {
+        errno = daemon_errno ? daemon_errno : EIO;
+        return -1;
+    }
+
+    if (got_len >= sizeof(int) && argp) {
+        memcpy(argp, outbuf, sizeof(int));
+    }
+
+    return out_rc;
 }
 
 /* tcflush wrapper */
 int tcflush(int fd, int queue_selector) {
     pthread_once(&init_once, init_once_fn);
-    return send_request(REQ_TCFLSH, fd, 0, &queue_selector);
+    if (!is_mapped(fd)) {
+        if (!real_tcflush) real_tcflush = dlsym(RTLD_NEXT, "tcflush");
+        if (!real_tcflush) { errno = ENOSYS; return -1; }
+        return real_tcflush(fd, queue_selector);
+    }
+
+    int arg = queue_selector;
+    int out_errno = 0, out_rc = 0;
+    if (send_request_and_get_response(REQ_TCFLSH, 0, &arg, sizeof(arg), &out_errno, NULL, 0, NULL, &out_rc) < 0) {
+        if (allow_fallback) {
+            if (!real_tcflush) real_tcflush = dlsym(RTLD_NEXT, "tcflush");
+            if (!real_tcflush) { errno = ENOSYS; return -1; }
+            return real_tcflush(fd, queue_selector);
+        }
+        errno = EIO; return -1;
+    }
+    if (out_rc < 0) { errno = out_errno ? out_errno : EIO; return -1; }
+    return out_rc;
 }
 
 /* tcsendbreak wrapper */
 int tcsendbreak(int fd, int duration) {
     pthread_once(&init_once, init_once_fn);
-    return send_request(REQ_TCSENDBREAK, fd, 0, &duration);
+    if (!is_mapped(fd)) {
+        if (!real_tcsendbreak) real_tcsendbreak = dlsym(RTLD_NEXT, "tcsendbreak");
+        if (!real_tcsendbreak) { errno = ENOSYS; return -1; }
+        return real_tcsendbreak(fd, duration);
+    }
+
+    int arg = duration;
+    int out_errno = 0, out_rc = 0;
+    if (send_request_and_get_response(REQ_TCSENDBREAK, 0, &arg, sizeof(arg), &out_errno, NULL, 0, NULL, &out_rc) < 0) {
+        if (allow_fallback) {
+            if (!real_tcsendbreak) real_tcsendbreak = dlsym(RTLD_NEXT, "tcsendbreak");
+            if (!real_tcsendbreak) { errno = ENOSYS; return -1; }
+            return real_tcsendbreak(fd, duration);
+        }
+        errno = EIO; return -1;
+    }
+    if (out_rc < 0) { errno = out_errno ? out_errno : EIO; return -1; }
+    return out_rc;
 }
 
 /* tcdrain wrapper */
 int tcdrain(int fd) {
     pthread_once(&init_once, init_once_fn);
-    return send_request(REQ_TCDRAIN, fd, 0, NULL);
-}
-
-static int send_request(int req_type, int fd, unsigned long request, void *argp) {
-    if (!is_mapped(fd) || !isatty(fd)) {
-        if (req_type == REQ_IOCTL) return passthrough_ioctl(fd, request, argp);
-        if (req_type == REQ_TCFLSH) return real_tcflush(fd, *(int*)argp);
-        if (req_type == REQ_TCSENDBREAK) return real_tcsendbreak(fd, *(int*)argp);
-        if (req_type == REQ_TCDRAIN) return real_tcdrain(fd);
-        errno = EINVAL;
-        return -1;
+    if (!is_mapped(fd)) {
+        if (!real_tcdrain) real_tcdrain = dlsym(RTLD_NEXT, "tcdrain");
+        if (!real_tcdrain) { errno = ENOSYS; return -1; }
+        return real_tcdrain(fd);
     }
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
-
-    int sock = connect_with_timeout(&addr, sizeof(addr), CONNECT_TIMEOUT_MS);
-    if (sock < 0) {
+    int out_errno = 0, out_rc = 0;
+    if (send_request_and_get_response(REQ_TCDRAIN, 0, NULL, 0, &out_errno, NULL, 0, NULL, &out_rc) < 0) {
         if (allow_fallback) {
-            if (req_type == REQ_IOCTL) return passthrough_ioctl(fd, request, argp);
-            if (req_type == REQ_TCFLSH) return real_tcflush(fd, *(int*)argp);
-            if (req_type == REQ_TCSENDBREAK) return real_tcsendbreak(fd, *(int*)argp);
-            if (req_type == REQ_TCDRAIN) return real_tcdrain(fd);
+            if (!real_tcdrain) real_tcdrain = dlsym(RTLD_NEXT, "tcdrain");
+            if (!real_tcdrain) { errno = ENOSYS; return -1; }
+            return real_tcdrain(fd);
         }
-        errno = EIO;
-        return -1;
+        errno = EIO; return -1;
     }
-
-    struct sm_header hdr = {
-        .magic = SM_MAGIC,
-        .type = req_type,
-        .payload_len = 0
-    };
-
-    struct sm_ioctl_req ioctl_req;
-    if (req_type == REQ_IOCTL) {
-        ioctl_req.request = request;
-        size_t arg_size = _IOC_SIZE(request);
-        int dir = _IOC_DIR(request);
-
-        switch (request) {
-            case TIOCMBIS:
-            case TIOCMBIC:
-            case TIOCMSET:
-                ioctl_req.arg_type = ARG_VALUE;
-                ioctl_req.arg_len = sizeof(int);
-                hdr.payload_len = sizeof(ioctl_req) + sizeof(int);
-                break;
-            default:
-                if (argp && (dir & _IOC_WRITE)) {
-                    ioctl_req.arg_type = ARG_BUFFER;
-                    ioctl_req.arg_len = arg_size;
-                    hdr.payload_len = sizeof(ioctl_req) + ioctl_req.arg_len;
-                } else {
-                    ioctl_req.arg_type = ARG_NONE;
-                    ioctl_req.arg_len = 0;
-                    hdr.payload_len = sizeof(ioctl_req);
-                }
-                break;
-        }
-    }
-
-    if (send_all(sock, &hdr, sizeof(hdr)) != sizeof(hdr)) {
-        close(sock);
-        errno = EIO;
-        return -1;
-    }
-
-    if (req_type == REQ_IOCTL) {
-        if (send_all(sock, &ioctl_req, sizeof(ioctl_req)) != sizeof(ioctl_req)) {
-            close(sock);
-            errno = EIO;
-            return -1;
-        }
-        if (ioctl_req.arg_type == ARG_BUFFER && ioctl_req.arg_len > 0) {
-            if (send_all(sock, argp, ioctl_req.arg_len) != (ssize_t)ioctl_req.arg_len) {
-                close(sock);
-                errno = EIO;
-                return -1;
-            }
-        } else if (ioctl_req.arg_type == ARG_VALUE) {
-            int val = (int)(intptr_t)argp;
-            if (send_all(sock, &val, sizeof(int)) != sizeof(int)) {
-                close(sock);
-                errno = EIO;
-                return -1;
-            }
-        }
-    } else {
-        if (argp == NULL) { // For tcdrain
-             if (send_all(sock, &hdr, sizeof(hdr)) != sizeof(hdr)) {
-                close(sock);
-                errno = EIO;
-                return -1;
-            }
-        }
-        else if (send_all(sock, argp, sizeof(int)) != sizeof(int)) {
-            close(sock);
-            errno = EIO;
-            return -1;
-        }
-    }
-
-    struct sm_response resp;
-    if (recv_all(sock, &resp, sizeof(resp)) != sizeof(resp)) {
-        close(sock);
-        errno = EIO;
-        return -1;
-    }
-
-    if (resp.rc < 0) {
-        errno = resp.errno_val;
-        close(sock);
-        return -1;
-    }
-
-    if (resp.payload_len > 0 && argp) {
-        if (recv_all(sock, argp, resp.payload_len) != (ssize_t)resp.payload_len) {
-            close(sock);
-            errno = EIO;
-            return -1;
-        }
-    }
-
-    close(sock);
-    return resp.rc;
+    if (out_rc < 0) { errno = out_errno ? out_errno : EIO; return -1; }
+    return out_rc;
 }
+
+/* End of file */

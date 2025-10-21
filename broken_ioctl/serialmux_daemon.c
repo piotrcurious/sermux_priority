@@ -1,4 +1,4 @@
-// serialmux_daemon.c - Serial mux daemon with ioctl/tc* forwarding support
+// serialmux_daemon.c - Serial mux daemon with a simplified, robust IPC mechanism.
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +23,8 @@
 #include <sys/uio.h>
 #endif
 
-#define SOCKET_PATH "/tmp/serialmux.sock"
+#define DATA_SOCKET_PATH "/tmp/serialmux.sock"
+#define CTRL_SOCKET_PATH "/tmp/serialmux_ctrl.sock"
 #define MAX_CLIENTS 10
 #define BUF_SIZE 4096
 
@@ -165,6 +166,26 @@ void restore_termios(int fd, struct termios *t) {
     }
 }
 
+void pause_low_priority_clients() {
+    log_msg("High priority client active. Pausing low priority clients.\n");
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (sp.clients[i].active && sp.clients[i].priority == PRIORITY_LOW) {
+            sp.clients[i].paused = 1;
+            log_msg("Paused low priority client PID %d\n", sp.clients[i].pid);
+        }
+    }
+}
+
+void resume_low_priority_clients() {
+    log_msg("Last high priority client disconnected. Resuming low priority clients.\n");
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (sp.clients[i].active && sp.clients[i].priority == PRIORITY_LOW) {
+            sp.clients[i].paused = 0;
+            log_msg("Resumed low priority client PID %d\n", sp.clients[i].pid);
+        }
+    }
+}
+
 /* client disconnect cleanup */
 void handle_client_disconnect(int client_idx) {
     pthread_mutex_lock(&sp.lock);
@@ -182,6 +203,10 @@ void handle_client_disconnect(int client_idx) {
     c->paused = 0;
     if (c->priority == PRIORITY_HIGH) {
         sp.num_high_priority--;
+        if (sp.num_high_priority <= 0) {
+            sp.num_high_priority = 0; // ensure it's not negative
+            resume_low_priority_clients();
+        }
     }
     pthread_mutex_unlock(&sp.lock);
 }
@@ -269,13 +294,20 @@ void* pty_relay_thread(void *arg) {
 }
 
 /* ---------- Binary control handling (SMIO protocol) ---------- */
-static int handle_binary_request(int ctrl_fd) {
+static void* handle_control_connection(void *arg) {
+    int ctrl_fd = *(int*)arg;
+    free(arg);
+
     struct sm_header hdr;
-    if (robust_read_all(ctrl_fd, &hdr, sizeof(hdr)) != sizeof(hdr)) return -1;
+    if (robust_read_all(ctrl_fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+        close(ctrl_fd);
+        return NULL;
+    }
 
     if (memcmp(hdr.magic, SM_MAGIC, sizeof(SM_MAGIC)) != 0) {
         log_msg("Invalid magic number\n");
-        return -1;
+        close(ctrl_fd);
+        return NULL;
     }
 
     struct sm_response resp = {0};
@@ -287,11 +319,13 @@ static int handle_binary_request(int ctrl_fd) {
             resp.rc = -1;
             resp.errno_val = ENOMEM;
             robust_write(ctrl_fd, &resp, sizeof(resp));
-            return -1;
+            close(ctrl_fd);
+            return NULL;
         }
         if (robust_read_all(ctrl_fd, payload, hdr.payload_len) != (ssize_t)hdr.payload_len) {
             free(payload);
-            return -1;
+            close(ctrl_fd);
+            return NULL;
         }
     }
 
@@ -316,6 +350,10 @@ static int handle_binary_request(int ctrl_fd) {
 
             if (resp.rc >= 0 && req->arg_type == ARG_BUFFER && (_IOC_DIR(req->request) & _IOC_READ)) {
                 resp.payload_len = req->arg_len;
+            }
+
+            if (req->request == TCSETS || req->request == TCSETSW || req->request == TCSETSF) {
+                save_termios(real_fd, &sp.current_settings);
             }
             break;
         }
@@ -346,7 +384,8 @@ static int handle_binary_request(int ctrl_fd) {
     }
 
     if (payload) free(payload);
-    return 0;
+    close(ctrl_fd);
+    return NULL;
 }
 
 
@@ -356,15 +395,6 @@ static int handle_binary_request(int ctrl_fd) {
 void* client_control_thread(void *arg) {
     int client_fd = *(int*)arg;
     free(arg);
-
-    // Peek to detect SMIO binary magic
-    char magic_peek[4];
-    ssize_t p = recv(client_fd, &magic_peek, sizeof(magic_peek), MSG_PEEK | MSG_DONTWAIT);
-    if (p == (ssize_t)sizeof(magic_peek) && memcmp(magic_peek, SM_MAGIC, sizeof(SM_MAGIC)) == 0) {
-        handle_binary_request(client_fd);
-        close(client_fd);
-        return NULL;
-    }
 
     // Not a binary magic: treat as text control (OPEN/CLOSE)
     char buf[512];
@@ -427,6 +457,15 @@ void* client_control_thread(void *arg) {
         c->priority = prio;
         c->pty_master_fd = pty_master;
         c->paused = 0;
+
+        if (prio == PRIORITY_HIGH) {
+            sp.num_high_priority++;
+            pause_low_priority_clients();
+        } else {
+            if (sp.num_high_priority > 0) {
+                c->paused = 1;
+            }
+        }
 
         // Apply current settings to the new PTY
         restore_termios(c->pty_master_fd, &sp.current_settings);
@@ -526,46 +565,77 @@ int main(int argc, char *argv[]) {
     set_cloexec(sig_pipe_fds[0]);
     set_cloexec(sig_pipe_fds[1]);
 
-    unlink(SOCKET_PATH);
-    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (socket_fd < 0) {
+    unlink(DATA_SOCKET_PATH);
+    int data_socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (data_socket_fd < 0) {
         perror("socket");
         close(sp.real_fd);
         exit(1);
     }
-    set_cloexec(socket_fd);
+    set_cloexec(data_socket_fd);
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, DATA_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
-    if (bind(socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (bind(data_socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
-        close(socket_fd);
+        close(data_socket_fd);
         close(sp.real_fd);
         exit(1);
     }
-    /* restrict socket permissions to owner read/write */
-    chmod(SOCKET_PATH, S_IRUSR | S_IWUSR);
+    chmod(DATA_SOCKET_PATH, S_IRUSR | S_IWUSR);
 
-    if (listen(socket_fd, MAX_CLIENTS) < 0) {
+    if (listen(data_socket_fd, MAX_CLIENTS) < 0) {
         perror("listen");
-        close(socket_fd);
+        close(data_socket_fd);
         close(sp.real_fd);
-        unlink(SOCKET_PATH);
+        unlink(DATA_SOCKET_PATH);
+        exit(1);
+    }
+
+    unlink(CTRL_SOCKET_PATH);
+    int ctrl_socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ctrl_socket_fd < 0) {
+        perror("socket");
+        close(sp.real_fd);
+        exit(1);
+    }
+    set_cloexec(ctrl_socket_fd);
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CTRL_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(ctrl_socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(ctrl_socket_fd);
+        close(sp.real_fd);
+        exit(1);
+    }
+    chmod(CTRL_SOCKET_PATH, S_IRUSR | S_IWUSR);
+
+    if (listen(ctrl_socket_fd, MAX_CLIENTS) < 0) {
+        perror("listen");
+        close(ctrl_socket_fd);
+        close(sp.real_fd);
+        unlink(CTRL_SOCKET_PATH);
         exit(1);
     }
 
     log_msg("Serial mux daemon started on %s\n", argv[1]);
-    log_msg("Listening on %s\n", SOCKET_PATH);
+    log_msg("Listening on %s and %s\n", DATA_SOCKET_PATH, CTRL_SOCKET_PATH);
 
     while (running) {
         fd_set readfds;
         FD_ZERO(&readfds);
-        FD_SET(socket_fd, &readfds);
+        FD_SET(data_socket_fd, &readfds);
+        FD_SET(ctrl_socket_fd, &readfds);
         FD_SET(sig_pipe_fds[0], &readfds);
-        int maxfd = socket_fd > sig_pipe_fds[0] ? socket_fd : sig_pipe_fds[0];
+        int maxfd = (data_socket_fd > ctrl_socket_fd ? data_socket_fd : ctrl_socket_fd);
+        maxfd = (maxfd > sig_pipe_fds[0] ? maxfd : sig_pipe_fds[0]);
+
         struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
         int ret = select(maxfd + 1, &readfds, NULL, NULL, &tv);
         if (ret < 0) {
@@ -581,8 +651,8 @@ int main(int argc, char *argv[]) {
             if (!running) break;
         }
 
-        if (FD_ISSET(socket_fd, &readfds)) {
-            int client_fd = accept(socket_fd, NULL, NULL);
+        if (FD_ISSET(data_socket_fd, &readfds)) {
+            int client_fd = accept(data_socket_fd, NULL, NULL);
             if (client_fd < 0) {
                 if (errno == EINTR) continue;
                 perror("accept");
@@ -607,6 +677,32 @@ int main(int argc, char *argv[]) {
             }
             pthread_detach(tid);
         }
+
+        if (FD_ISSET(ctrl_socket_fd, &readfds)) {
+             int client_fd = accept(ctrl_socket_fd, NULL, NULL);
+            if (client_fd < 0) {
+                if (errno == EINTR) continue;
+                perror("accept");
+                continue;
+            }
+            set_cloexec(client_fd);
+
+            pthread_t tid;
+            int *pfd = malloc(sizeof(int));
+             if (!pfd) {
+                log_msg("malloc failed for control thread arg\n");
+                close(client_fd);
+                continue;
+            }
+            *pfd = client_fd;
+            if (pthread_create(&tid, NULL, handle_control_connection, pfd) != 0) {
+                log_msg("pthread_create failed for control thread\n");
+                free(pfd);
+                close(client_fd);
+                continue;
+            }
+            pthread_detach(tid);
+        }
     }
 
     log_msg("Shutting down: restoring original termios\n");
@@ -622,8 +718,10 @@ int main(int argc, char *argv[]) {
     pthread_mutex_unlock(&sp.lock);
 
     close(sp.real_fd);
-    close(socket_fd);
-    unlink(SOCKET_PATH);
+    close(data_socket_fd);
+    close(ctrl_socket_fd);
+    unlink(DATA_SOCKET_PATH);
+    unlink(CTRL_SOCKET_PATH);
     if (sig_pipe_fds[0] >= 0) close(sig_pipe_fds[0]);
     if (sig_pipe_fds[1] >= 0) close(sig_pipe_fds[1]);
 

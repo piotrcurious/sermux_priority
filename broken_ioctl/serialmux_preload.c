@@ -1,5 +1,5 @@
 // serialmux_preload.c
-// LD_PRELOAD library for serialmux (Linux) with ioctl/tc* forwarding
+// LD_PRELOAD library for serialmux (Linux) with a simplified, robust IPC mechanism.
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +20,8 @@
 #include <poll.h>
 #include <sys/time.h>
 
-#define SOCKET_PATH "/tmp/serialmux.sock"
+#define DATA_SOCKET_PATH "/tmp/serialmux.sock"
+#define CTRL_SOCKET_PATH "/tmp/serialmux_ctrl.sock"
 #define DAEMON_DEVICE_ENV "SERIALMUX_DEVICE"
 #define SERIALMUX_FALLBACK_ENV "SERIALMUX_FALLBACK"
 #define MAX_MAPPED_FDS 1024
@@ -238,7 +239,7 @@ static int connect_and_get_pty(const char *device, char *pty_path_buf, size_t bu
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, DATA_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     int sock = connect_with_timeout(&addr, sizeof(addr), CONNECT_TIMEOUT_MS);
     if (sock < 0) return -1;
@@ -550,7 +551,7 @@ static int send_request(int req_type, int fd, unsigned long request, void *argp)
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, CTRL_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     int sock = connect_with_timeout(&addr, sizeof(addr), CONNECT_TIMEOUT_MS);
     if (sock < 0) {
@@ -595,6 +596,8 @@ static int send_request(int req_type, int fd, unsigned long request, void *argp)
                 }
                 break;
         }
+    } else if (argp != NULL) {
+        hdr.payload_len = sizeof(int);
     }
 
     if (send_all(sock, &hdr, sizeof(hdr)) != sizeof(hdr)) {

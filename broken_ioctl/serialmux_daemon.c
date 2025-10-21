@@ -254,8 +254,7 @@ void* pty_relay_thread(void *arg) {
             if (!paused) {
                 ssize_t n = read(real_fd, buf, sizeof(buf));
                 if (n > 0) {
-                    ssize_t w = write(pty_fd, buf, n);
-                    (void)w;
+                    robust_write(pty_fd, buf, n);
                 } else if (n == 0) {
                     log_msg("Real serial port hung up. Terminating relay for client %d.\n", c->pid);
                     break;
@@ -297,6 +296,17 @@ void* pty_relay_thread(void *arg) {
 static void* handle_control_connection(void *arg) {
     int ctrl_fd = *(int*)arg;
     free(arg);
+
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(ctrl_fd, &readfds);
+
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    int ret = select(ctrl_fd + 1, &readfds, NULL, NULL, &tv);
+    if (ret <= 0) {
+        close(ctrl_fd);
+        return NULL;
+    }
 
     struct sm_header hdr;
     if (robust_read_all(ctrl_fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {

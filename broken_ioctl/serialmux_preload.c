@@ -585,7 +585,7 @@ static int send_request(int req_type, int fd, unsigned long request, void *argp)
                 hdr.payload_len = sizeof(ioctl_req) + sizeof(int);
                 break;
             default:
-                if (argp && (dir & _IOC_WRITE)) {
+                if (argp && (dir & (_IOC_WRITE | _IOC_READ))) {
                     ioctl_req.arg_type = ARG_BUFFER;
                     ioctl_req.arg_len = arg_size;
                     hdr.payload_len = sizeof(ioctl_req) + ioctl_req.arg_len;

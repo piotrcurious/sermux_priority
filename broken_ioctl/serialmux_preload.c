@@ -19,6 +19,8 @@
 #include <stdint.h>
 #include <poll.h>
 #include <sys/time.h>
+#include <arpa/inet.h>
+#include <byteswap.h>
 
 #define DATA_SOCKET_PATH "/tmp/serialmux.sock"
 #define CTRL_SOCKET_PATH "/tmp/serialmux_ctrl.sock"
@@ -26,11 +28,13 @@
 #define SERIALMUX_FALLBACK_ENV "SERIALMUX_FALLBACK"
 #define MAX_MAPPED_FDS 1024
 #define CONNECT_TIMEOUT_MS 200
+#define MAGIC 0x534d494f
 
 #include "serialmux.h"
 
 typedef struct {
     int fd;
+    int ioctl_sock;
     pid_t pid;
 } FDMapping;
 
@@ -44,21 +48,8 @@ static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 
 /* libc function pointers */
 static int (*real_open)(const char *, int, ...) = NULL;
-static int (*real_open64)(const char *, int, ...) = NULL;
-static int (*real_openat)(int, const char *, int, ...) = NULL;
 static int (*real_close)(int) = NULL;
-static int (*real_dup)(int) = NULL;
-static int (*real_dup2)(int, int) = NULL;
-static int (*real_dup3)(int, int, int) = NULL;
-static int (*real_fcntl)(int, int, ...) = NULL;
-static FILE *(*real_fdopen)(int, const char *) = NULL;
-static FILE *(*real_fopen)(const char *, const char *) = NULL;
-static FILE *(*real_freopen)(const char *, const char *, FILE *) = NULL;
-static int (*real_fclose)(FILE *) = NULL;
-static int (*real_ioctl)(int, unsigned long, void *) = NULL;
-static int (*real_tcflush)(int, int) = NULL;
-static int (*real_tcsendbreak)(int, int) = NULL;
-static int (*real_tcdrain)(int) = NULL;
+static int (*real_ioctl)(int, unsigned long, ...) = NULL;
 
 /* debug helper */
 static void debug_log(const char *fmt, ...) {
@@ -70,21 +61,33 @@ static void debug_log(const char *fmt, ...) {
     va_end(ap);
 }
 
+static void resolve_symbols() {
+    if (!real_open) real_open = dlsym(RTLD_NEXT, "open");
+    if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+}
+
 /* mapping helpers */
-static void add_mapping(int fd) {
-    if (fd < 0) return;
+static FDMapping *add_mapping(int fd) {
+    if (fd < 0) return NULL;
     pthread_mutex_lock(&map_lock);
     for (int i = 0; i < num_mapped; ++i) {
-        if (fd_map[i].fd == fd) { pthread_mutex_unlock(&map_lock); return; }
+        if (fd_map[i].fd == fd) {
+            pthread_mutex_unlock(&map_lock);
+            return &fd_map[i];
+        }
     }
     if (num_mapped < MAX_MAPPED_FDS) {
         fd_map[num_mapped].fd = fd;
         fd_map[num_mapped].pid = getpid();
+        fd_map[num_mapped].ioctl_sock = -1;
+        int idx = num_mapped;
         ++num_mapped;
-    } else {
-        debug_log("mapping overflow, cannot track fd %d", fd);
+        pthread_mutex_unlock(&map_lock);
+        return &fd_map[idx];
     }
     pthread_mutex_unlock(&map_lock);
+    return NULL;
 }
 
 static void remove_mapping(int fd) {
@@ -95,21 +98,24 @@ static void remove_mapping(int fd) {
         if (fd_map[i].fd == fd) { idx = i; break; }
     }
     if (idx != -1) {
+        if (fd_map[idx].ioctl_sock >= 0) close(fd_map[idx].ioctl_sock);
         fd_map[idx] = fd_map[num_mapped - 1];
         --num_mapped;
     }
     pthread_mutex_unlock(&map_lock);
 }
 
-static int is_mapped(int fd) {
-    if (fd < 0) return 0;
+static FDMapping *find_mapping(int fd) {
+    if (fd < 0) return NULL;
     pthread_mutex_lock(&map_lock);
-    int found = 0;
     for (int i = 0; i < num_mapped; ++i) {
-        if (fd_map[i].fd == fd) { found = 1; break; }
+        if (fd_map[i].fd == fd) {
+            pthread_mutex_unlock(&map_lock);
+            return &fd_map[i];
+        }
     }
     pthread_mutex_unlock(&map_lock);
-    return found;
+    return NULL;
 }
 
 /* robust send/recv helpers */
@@ -120,7 +126,6 @@ static ssize_t send_all(int sock, const void *buf, size_t len) {
         ssize_t s = send(sock, p, left, MSG_NOSIGNAL);
         if (s < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(1000); continue; }
             return -1;
         }
         p += s;
@@ -129,14 +134,13 @@ static ssize_t send_all(int sock, const void *buf, size_t len) {
     return (ssize_t)len;
 }
 
-static ssize_t recv_all(int sock, void *buf, size_t len) {
+static ssize_t recv_all_fd(int sock, void *buf, size_t len) {
     unsigned char *p = buf;
     size_t left = len;
     while (left > 0) {
         ssize_t r = recv(sock, p, left, 0);
         if (r < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(1000); continue; }
             return -1;
         }
         if (r == 0) return (ssize_t)(len - left); // peer closed
@@ -157,7 +161,6 @@ static int connect_with_timeout(const struct sockaddr_un *addr, socklen_t addrle
 
     int rc = connect(sock, (const struct sockaddr *)addr, addrlen);
     if (rc == 0) {
-        // connected immediately, restore flags
         fcntl(sock, F_SETFL, flags);
         return sock;
     }
@@ -175,7 +178,6 @@ static int connect_with_timeout(const struct sockaddr_un *addr, socklen_t addrle
             close(sock);
             return -1;
         }
-        // success
         fcntl(sock, F_SETFL, flags);
         return sock;
     }
@@ -183,35 +185,8 @@ static int connect_with_timeout(const struct sockaddr_un *addr, socklen_t addrle
     return -1;
 }
 
-static int send_request(int req_type, int fd, unsigned long request, void *argp);
-
-/* passthrough ioctl (call libc's ioctl on current fd) */
-static int passthrough_ioctl(int fd, unsigned long request, void *argp) {
-    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
-    if (!real_ioctl) { errno = ENOSYS; return -1; }
-    return real_ioctl(fd, request, argp);
-}
-
-/* init function */
 static void init_once_fn(void) {
-    dlerror();
-    real_open = dlsym(RTLD_NEXT, "open");
-    real_open64 = dlsym(RTLD_NEXT, "open64");
-    real_openat = dlsym(RTLD_NEXT, "openat");
-    real_close = dlsym(RTLD_NEXT, "close");
-    real_dup = dlsym(RTLD_NEXT, "dup");
-    real_dup2 = dlsym(RTLD_NEXT, "dup2");
-    real_dup3 = dlsym(RTLD_NEXT, "dup3");
-    real_fcntl = dlsym(RTLD_NEXT, "fcntl");
-    real_fdopen = dlsym(RTLD_NEXT, "fdopen");
-    real_fopen = dlsym(RTLD_NEXT, "fopen");
-    real_freopen = dlsym(RTLD_NEXT, "freopen");
-    real_fclose = dlsym(RTLD_NEXT, "fclose");
-    real_ioctl = dlsym(RTLD_NEXT, "ioctl");
-    real_tcflush = dlsym(RTLD_NEXT, "tcflush");
-    real_tcsendbreak = dlsym(RTLD_NEXT, "tcsendbreak");
-    real_tcdrain = dlsym(RTLD_NEXT, "tcdrain");
-
+    resolve_symbols();
     char *env = getenv(DAEMON_DEVICE_ENV);
     if (env) target_device = strdup(env);
     char *fb = getenv(SERIALMUX_FALLBACK_ENV);
@@ -220,443 +195,121 @@ static void init_once_fn(void) {
     if (!target_device) debug_log("%s unset: preload will not intercept device unless configured", DAEMON_DEVICE_ENV);
 }
 
-/* helper: mode conversion for fopen */
-static int fopen_mode_to_flags(const char *mode) {
-    if (!mode) return O_RDONLY;
-    int plus = strchr(mode, '+') != NULL;
-    int r = strchr(mode, 'r') != NULL;
-    int w = strchr(mode, 'w') != NULL;
-    int a = strchr(mode, 'a') != NULL;
-    if (plus) return O_RDWR;
-    if (r && !w && !a) return O_RDONLY;
-    if (w) return O_WRONLY | O_CREAT | O_TRUNC;
-    if (a) return O_WRONLY | O_CREAT | O_APPEND;
-    return O_RDONLY;
-}
+/* wrapper implementations */
+int open(const char *path, int flags, ...) {
+    pthread_once(&init_once, init_once_fn);
 
-/* connect to daemon and request PTY path (text protocol existing in daemon) */
-static int connect_and_get_pty(const char *device, char *pty_path_buf, size_t buf_size) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+
+    if (!target_device || strcmp(path, target_device) != 0) {
+        return real_open(path, flags, mode);
+    }
+
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, DATA_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
-    int sock = connect_with_timeout(&addr, sizeof(addr), CONNECT_TIMEOUT_MS);
-    if (sock < 0) return -1;
+    int sock = connect_with_timeout((struct sockaddr_un *)&addr, sizeof(addr), CONNECT_TIMEOUT_MS);
+    if (sock < 0) {
+        if (allow_fallback) return real_open(path, flags, mode);
+        errno = EIO;
+        return -1;
+    }
 
-    const char *priority_str = getenv("SERIALMUX_PRIORITY");
-    int prio = (priority_str && strcmp(priority_str, "HIGH") == 0) ? 1 : 0;
+    FDMapping *mapping = add_mapping(sock);
 
-    char msg[512];
-    int len = snprintf(msg, sizeof(msg), "OPEN:%s:%d:%d", device, prio, (int)getpid());
-    if (len < 0 || (size_t)len >= sizeof(msg)) { close(sock); return -1; }
+    struct sockaddr_un ctrl_addr;
+    memset(&ctrl_addr, 0, sizeof(ctrl_addr));
+    ctrl_addr.sun_family = AF_UNIX;
+    strncpy(ctrl_addr.sun_path, CTRL_SOCKET_PATH, sizeof(ctrl_addr.sun_path) - 1);
+    mapping->ioctl_sock = connect_with_timeout((struct sockaddr_un *)&ctrl_addr, sizeof(ctrl_addr), CONNECT_TIMEOUT_MS);
 
-    if (send_all(sock, msg, (size_t)len + 1) < 0) { close(sock); return -1; }
-
-    ssize_t n = recv(sock, pty_path_buf, buf_size - 1, 0);
-    close(sock);
-    if (n <= 0) return -1;
-    pty_path_buf[n] = '\0';
-    if (strncmp(pty_path_buf, "ERROR:", 6) == 0) return -1;
-    return 0;
+    return sock;
 }
 
-/* wrapper implementations */
-
-/* open */
-int open(const char *path, int flags, ...) {
-    pthread_once(&init_once, init_once_fn);
-
-    mode_t mode = 0;
-    int need_mode = (flags & O_CREAT) != 0;
-    if (need_mode) {
-        va_list ap;
-        va_start(ap, flags);
-        mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-    }
-
-    if (!target_device || strcmp(path, target_device) != 0) {
-        if (need_mode) return real_open(path, flags, mode);
-        else return real_open(path, flags);
-    }
-
-    char pty_path[256];
-    if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
-        int fd = need_mode ? real_open(pty_path, flags, mode) : real_open(pty_path, flags);
-        if (fd >= 0) add_mapping(fd);
-        return fd;
-    }
-
-    if (allow_fallback) {
-        debug_log("daemon unreachable, falling back to real open(%s)", path);
-        if (need_mode) return real_open(path, flags, mode);
-        else return real_open(path, flags);
-    }
-
-    errno = EIO;
-    return -1;
-}
-
-/* open64 */
-int open64(const char *path, int flags, ...) {
-    pthread_once(&init_once, init_once_fn);
-
-    mode_t mode = 0;
-    int need_mode = (flags & O_CREAT) != 0;
-    if (need_mode) {
-        va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap);
-    }
-
-    if (!target_device || strcmp(path, target_device) != 0) {
-        if (real_open64) {
-            if (need_mode) return real_open64(path, flags, mode);
-            else return real_open64(path, flags);
-        } else {
-            if (need_mode) return real_open(path, flags, mode);
-            else return real_open(path, flags);
-        }
-    }
-
-    char pty_path[256];
-    if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
-        int fd = need_mode ? real_open64(pty_path, flags, mode) : real_open(pty_path, flags);
-        if (fd >= 0) add_mapping(fd);
-        return fd;
-    }
-
-    if (allow_fallback) {
-        if (real_open64) {
-            if (need_mode) return real_open64(path, flags, mode);
-            else return real_open64(path, flags);
-        } else {
-            if (need_mode) return real_open(path, flags, mode);
-            else return real_open(path, flags);
-        }
-    }
-
-    errno = EIO;
-    return -1;
-}
-
-/* openat */
-int openat(int dirfd, const char *path, int flags, ...) {
-    pthread_once(&init_once, init_once_fn);
-
-    mode_t mode = 0;
-    int need_mode = (flags & O_CREAT) != 0;
-    if (need_mode) {
-        va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap);
-    }
-
-    if (!target_device || strcmp(path, target_device) != 0) {
-        if (real_openat) {
-            if (need_mode) return real_openat(dirfd, path, flags, mode);
-            else return real_openat(dirfd, path, flags);
-        } else {
-            if (need_mode) return real_open(path, flags, mode);
-            else return real_open(path, flags);
-        }
-    }
-
-    char pty_path[256];
-    if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
-        int fd = need_mode ? real_open(pty_path, flags, mode) : real_open(pty_path, flags);
-        if (fd >= 0) add_mapping(fd);
-        return fd;
-    }
-
-    if (allow_fallback) {
-        if (real_openat) {
-            if (need_mode) return real_openat(dirfd, path, flags, mode);
-            else return real_openat(dirfd, path, flags);
-        } else {
-            if (need_mode) return real_open(path, flags, mode);
-            else return real_open(path, flags);
-        }
-    }
-
-    errno = EIO;
-    return -1;
-}
-
-/* creat */
-int creat(const char *path, mode_t mode) {
-    pthread_once(&init_once, init_once_fn);
-    return open(path, O_CREAT | O_WRONLY | O_TRUNC, mode);
-}
-
-/* fopen */
-FILE *fopen(const char *path, const char *mode_str) {
-    pthread_once(&init_once, init_once_fn);
-
-    if (!target_device || strcmp(path, target_device) != 0) {
-        if (real_fopen) return real_fopen(path, mode_str);
-        int fd = real_open(path, fopen_mode_to_flags(mode_str), 0666);
-        if (fd < 0) return NULL;
-        FILE *f = real_fdopen(fd, mode_str);
-        if (!f) { real_close(fd); return NULL; }
-        return f;
-    }
-
-    char pty_path[256];
-    if (connect_and_get_pty(path, pty_path, sizeof(pty_path)) == 0) {
-        int flags = fopen_mode_to_flags(mode_str);
-        int fd = real_open(pty_path, flags, 0666);
-        if (fd < 0) {
-            if (allow_fallback) {
-                int fd2 = real_open(path, flags, 0666);
-                if (fd2 < 0) return NULL;
-                FILE *f2 = real_fdopen(fd2, mode_str);
-                if (!f2) { real_close(fd2); return NULL; }
-                return f2;
-            }
-            return NULL;
-        }
-        add_mapping(fd);
-        FILE *f = real_fdopen(fd, mode_str);
-        if (!f) { remove_mapping(fd); real_close(fd); return NULL; }
-        return f;
-    }
-
-    if (allow_fallback) {
-        if (real_fopen) return real_fopen(path, mode_str);
-        int fd = real_open(path, fopen_mode_to_flags(mode_str), 0666);
-        if (fd < 0) return NULL;
-        FILE *f = real_fdopen(fd, mode_str);
-        if (!f) { real_close(fd); return NULL; }
-        return f;
-    }
-
-    errno = EIO;
-    return NULL;
-}
-
-/* freopen (path != NULL simplified handling) */
-FILE *freopen(const char *path, const char *mode_str, FILE *stream) {
-    pthread_once(&init_once, init_once_fn);
-    if (!path) {
-        if (real_freopen) return real_freopen(path, mode_str, stream);
-        errno = EINVAL;
-        return NULL;
-    }
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wnonnull-compare"
-    if (stream) {
-        int oldfd = fileno(stream);
-        if (oldfd >= 0) remove_mapping(oldfd);
-        if (real_fclose) real_fclose(stream);
-        else fclose(stream);
-    }
-    #pragma GCC diagnostic pop
-    return fopen(path, mode_str);
-}
-
-/* close */
 int close(int fd) {
-    pthread_once(&init_once, init_once_fn);
+    resolve_symbols();
     remove_mapping(fd);
     return real_close(fd);
 }
 
-/* dup */
-int dup(int oldfd) {
-    pthread_once(&init_once, init_once_fn);
-    int newfd = real_dup(oldfd);
-    if (newfd >= 0 && is_mapped(oldfd)) add_mapping(newfd);
-    return newfd;
-}
-
-/* dup2 */
-int dup2(int oldfd, int newfd) {
-    pthread_once(&init_once, init_once_fn);
-    int r = real_dup2(oldfd, newfd);
-    if (r >= 0) {
-        if (is_mapped(oldfd)) add_mapping(newfd);
-        else remove_mapping(newfd);
-    }
-    return r;
-}
-
-/* dup3 */
-int dup3(int oldfd, int newfd, int flags) {
-    pthread_once(&init_once, init_once_fn);
-    int r = -1;
-    if (real_dup3) r = real_dup3(oldfd, newfd, flags);
-    else r = real_dup2(oldfd, newfd);
-    if (r >= 0) {
-        if (is_mapped(oldfd)) add_mapping(newfd);
-        else remove_mapping(newfd);
-    }
-    return r;
-}
-
-/* fcntl (handle dup operations) */
-int fcntl(int fd, int cmd, ...) {
-    pthread_once(&init_once, init_once_fn);
-    va_list ap;
-    va_start(ap, cmd);
-    int arg = va_arg(ap, int);
-    va_end(ap);
-
-    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
-        int newfd = real_fcntl(fd, cmd, arg);
-        if (newfd >= 0 && is_mapped(fd)) add_mapping(newfd);
-        return newfd;
-    }
-
-    // pass-through for other commands (note: does not handle pointer args)
-    return real_fcntl(fd, cmd, arg);
-}
-
-/* ioctl wrapper: forward ioctls to daemon when fd mapped */
 int ioctl(int fd, unsigned long request, ...) {
-    pthread_once(&init_once, init_once_fn);
+    resolve_symbols();
     va_list ap;
     va_start(ap, request);
-    void *argp = va_arg(ap, void*);
+    void *argp = va_arg(ap, void *);
     va_end(ap);
 
-    return send_request(REQ_IOCTL, fd, request, argp);
-}
+    FDMapping *c = find_mapping(fd);
+    if (!c) {
+        return real_ioctl(fd, request, argp);
+    }
 
-/* tcflush wrapper */
-int tcflush(int fd, int queue_selector) {
-    pthread_once(&init_once, init_once_fn);
-    return send_request(REQ_TCFLSH, fd, 0, &queue_selector);
-}
+    static uint32_t next_req = 1;
+    uint32_t req_id = __sync_fetch_and_add(&next_req, 1);
 
-/* tcsendbreak wrapper */
-int tcsendbreak(int fd, int duration) {
-    pthread_once(&init_once, init_once_fn);
-    return send_request(REQ_TCSENDBREAK, fd, 0, &duration);
-}
+    uint32_t net_magic = htonl(MAGIC);
+    uint32_t net_reqid = htonl(req_id);
+    uint64_t ioc = (uint64_t)request;
+    uint64_t ioc_be = htobe64(ioc);
 
-/* tcdrain wrapper */
-int tcdrain(int fd) {
-    pthread_once(&init_once, init_once_fn);
-    return send_request(REQ_TCDRAIN, fd, 0, NULL);
-}
+    size_t arg_len = ioctl_arg_size(request);
+    char tmpbuf[128];
+    void *payload = NULL;
 
-static int send_request(int req_type, int fd, unsigned long request, void *argp) {
-    if (!is_mapped(fd) || !isatty(fd)) {
-        if (req_type == REQ_IOCTL) return passthrough_ioctl(fd, request, argp);
-        if (req_type == REQ_TCFLSH) return real_tcflush(fd, *(int*)argp);
-        if (req_type == REQ_TCSENDBREAK) return real_tcsendbreak(fd, *(int*)argp);
-        if (req_type == REQ_TCDRAIN) return real_tcdrain(fd);
-        errno = EINVAL;
+    if (argp && arg_len > 0) {
+        if (arg_len > sizeof(tmpbuf)) payload = malloc(arg_len);
+        else payload = tmpbuf;
+        memcpy(payload, argp, arg_len);
+    }
+
+    uint32_t arg_len32 = (uint32_t)arg_len;
+    uint32_t net_arg_len = htonl(arg_len32);
+
+    if (send_all(c->ioctl_sock, &net_magic, 4) < 0) { if (payload != tmpbuf) free(payload); errno = EIO; return -1; }
+    if (send_all(c->ioctl_sock, &net_reqid, 4) < 0) { if (payload != tmpbuf) free(payload); errno = EIO; return -1; }
+    if (send_all(c->ioctl_sock, &ioc_be, 8) < 0) { if (payload != tmpbuf) free(payload); errno = EIO; return -1; }
+    if (send_all(c->ioctl_sock, &net_arg_len, 4) < 0) { if (payload != tmpbuf) free(payload); errno = EIO; return -1; }
+    if (arg_len) {
+        if (send_all(c->ioctl_sock, payload, arg_len) < 0) { if (payload != tmpbuf) free(payload); errno = EIO; return -1; }
+    }
+    if (payload != tmpbuf && payload) free(payload);
+
+    uint32_t resp_reqid_n;
+    int32_t resp_ret_n, resp_errno_n;
+    uint32_t resp_outlen_n;
+    if (recv_all_fd(c->ioctl_sock, &resp_reqid_n, 4) < 0) { errno = EIO; return -1; }
+    if (recv_all_fd(c->ioctl_sock, &resp_ret_n, 4) < 0) { errno = EIO; return -1; }
+    if (recv_all_fd(c->ioctl_sock, &resp_errno_n, 4) < 0) { errno = EIO; return -1; }
+    if (recv_all_fd(c->ioctl_sock, &resp_outlen_n, 4) < 0) { errno = EIO; return -1; }
+
+    uint32_t resp_reqid = ntohl(resp_reqid_n);
+    int32_t resp_ret = ntohl(resp_ret_n);
+    int32_t resp_errno = ntohl(resp_errno_n);
+    uint32_t resp_outlen = ntohl(resp_outlen_n);
+
+    if (resp_reqid != req_id) {
+        errno = EIO; return -1;
+    }
+
+    if (resp_outlen > 0 && argp) {
+        void *outbuf = malloc(resp_outlen);
+        if (!outbuf) { errno = ENOMEM; return -1; }
+        if (recv_all_fd(c->ioctl_sock, outbuf, resp_outlen) < 0) { free(outbuf); errno = EIO; return -1; }
+        memcpy(argp, outbuf, resp_outlen);
+        free(outbuf);
+    }
+
+    if (resp_ret == -1) {
+        errno = resp_errno;
         return -1;
     }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, CTRL_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-
-    int sock = connect_with_timeout(&addr, sizeof(addr), CONNECT_TIMEOUT_MS);
-    if (sock < 0) {
-        if (allow_fallback) {
-            if (req_type == REQ_IOCTL) return passthrough_ioctl(fd, request, argp);
-            if (req_type == REQ_TCFLSH) return real_tcflush(fd, *(int*)argp);
-            if (req_type == REQ_TCSENDBREAK) return real_tcsendbreak(fd, *(int*)argp);
-            if (req_type == REQ_TCDRAIN) return real_tcdrain(fd);
-        }
-        errno = EIO;
-        return -1;
-    }
-
-    struct sm_header hdr;
-    memcpy(hdr.magic, SM_MAGIC, sizeof(SM_MAGIC));
-    hdr.type = req_type;
-    hdr.payload_len = 0;
-
-    struct sm_ioctl_req ioctl_req;
-    if (req_type == REQ_IOCTL) {
-        ioctl_req.request = request;
-        size_t arg_size = _IOC_SIZE(request);
-        int dir = _IOC_DIR(request);
-
-        switch (request) {
-            case TIOCMBIS:
-            case TIOCMBIC:
-            case TIOCMSET:
-                ioctl_req.arg_type = ARG_VALUE;
-                ioctl_req.arg_len = sizeof(int);
-                hdr.payload_len = sizeof(ioctl_req) + sizeof(int);
-                break;
-            default:
-                if (argp && (dir & (_IOC_WRITE | _IOC_READ))) {
-                    ioctl_req.arg_type = ARG_BUFFER;
-                    ioctl_req.arg_len = arg_size;
-                    hdr.payload_len = sizeof(ioctl_req) + ioctl_req.arg_len;
-                } else {
-                    ioctl_req.arg_type = ARG_NONE;
-                    ioctl_req.arg_len = 0;
-                    hdr.payload_len = sizeof(ioctl_req);
-                }
-                break;
-        }
-    } else if (argp != NULL) {
-        hdr.payload_len = sizeof(int);
-    }
-
-    if (send_all(sock, &hdr, sizeof(hdr)) != sizeof(hdr)) {
-        close(sock);
-        errno = EIO;
-        return -1;
-    }
-
-    if (req_type == REQ_IOCTL) {
-        if (send_all(sock, &ioctl_req, sizeof(ioctl_req)) != sizeof(ioctl_req)) {
-            close(sock);
-            errno = EIO;
-            return -1;
-        }
-        if (ioctl_req.arg_type == ARG_BUFFER && ioctl_req.arg_len > 0) {
-            if (send_all(sock, argp, ioctl_req.arg_len) != (ssize_t)ioctl_req.arg_len) {
-                close(sock);
-                errno = EIO;
-                return -1;
-            }
-        } else if (ioctl_req.arg_type == ARG_VALUE) {
-            int val = (int)(intptr_t)argp;
-            if (send_all(sock, &val, sizeof(int)) != sizeof(int)) {
-                close(sock);
-                errno = EIO;
-                return -1;
-            }
-        }
-    } else {
-        if (argp != NULL) {
-             if (send_all(sock, argp, sizeof(int)) != sizeof(int)) {
-                close(sock);
-                errno = EIO;
-                return -1;
-            }
-        }
-    }
-
-    struct sm_response resp;
-    if (recv_all(sock, &resp, sizeof(resp)) != sizeof(resp)) {
-        close(sock);
-        errno = EIO;
-        return -1;
-    }
-
-    if (resp.rc < 0) {
-        errno = resp.errno_val;
-        close(sock);
-        return -1;
-    }
-
-    if (resp.payload_len > 0 && argp) {
-        if (recv_all(sock, argp, resp.payload_len) != (ssize_t)resp.payload_len) {
-            close(sock);
-            errno = EIO;
-            return -1;
-        }
-    }
-
-    close(sock);
-    return resp.rc;
+    return resp_ret;
 }

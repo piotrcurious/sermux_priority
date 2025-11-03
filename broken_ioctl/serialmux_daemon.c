@@ -1,104 +1,62 @@
-// serialmux_daemon.c - Serial mux daemon with a simplified, robust IPC mechanism.
+// serialmux_daemon.c
+// Main daemon for serialmux. Manages the physical serial port and handles client connections.
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/select.h>
-#include <sys/types.h>
+#include <termios.h>
 #include <pthread.h>
 #include <signal.h>
 #include <errno.h>
-#include <time.h>
-#include <stdarg.h>
+#include <sys/epoll.h>
+#include <byteswap.h>
+#include <arpa/inet.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <stdint.h>
-
-#ifdef __linux__
-#include <sys/uio.h>
-#endif
+#include "serialmux.h"
 
 #define DATA_SOCKET_PATH "/tmp/serialmux.sock"
 #define CTRL_SOCKET_PATH "/tmp/serialmux_ctrl.sock"
+#define DAEMON_DEVICE_ENV "SERIALMUX_DEVICE"
 #define MAX_CLIENTS 10
-#define BUF_SIZE 4096
+#define MAX_EPOLL_EVENTS (MAX_CLIENTS + 1)
+#define MAGIC 0x534d494f
 
-#include "serialmux.h"
+static int running = 1;
+static int pty_fd = -1;
 
-typedef enum { PRIORITY_LOW = 0, PRIORITY_HIGH = 1 } Priority;
-
-typedef struct {
-    int active;
-    int paused;
-    pid_t pid;               // pid reported by client (text open) or 0
-    Priority priority;
-    int pty_master_fd;
-} Client;
-
-typedef struct {
-    int real_fd;
-    char device[256];
-    struct termios current_settings;
-    Client clients[MAX_CLIENTS];
-    int num_high_priority;
-    pthread_mutex_t lock;
-} SerialPort;
-
-static SerialPort sp;
-static struct termios original_real_settings;
-volatile sig_atomic_t running = 1;
-static int sig_pipe_fds[2] = { -1, -1 };
-
-/* Logging helper */
-void log_msg(const char *fmt, ...) {
-    va_list args;
-    time_t now = time(NULL);
-    char timestr[64];
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-    strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", &tm_now);
-    printf("[%s] ", timestr);
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
-    fflush(stdout);
+void handle_signal(int sig) {
+    running = 0;
+    (void)sig; // Unused parameter
 }
 
-/* set FD_CLOEXEC */
-static int set_cloexec(int fd) {
-    int flags = fcntl(fd, F_GETFD);
-    if (flags < 0) return -1;
-    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
-}
-
-/* robust write - handle partial writes and EINTR */
-ssize_t robust_write(int fd, const void *buf, size_t count) {
+/* robust send/recv helpers */
+static ssize_t send_all(int sock, const void *buf, size_t len) {
     const unsigned char *p = buf;
-    size_t left = count;
+    size_t left = len;
     while (left > 0) {
-        ssize_t w = write(fd, p, left);
-        if (w < 0) {
+        ssize_t s = send(sock, p, left, MSG_NOSIGNAL);
+        if (s < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(1000); continue; }
             return -1;
         }
-        p += w;
-        left -= (size_t)w;
+        p += s;
+        left -= (size_t)s;
     }
-    return (ssize_t)count;
+    return (ssize_t)len;
 }
 
-/* robust read-all helper for fixed-size reads */
-static ssize_t robust_read_all(int fd, void *buf, size_t len) {
+static ssize_t recv_all(int sock, void *buf, size_t len) {
     unsigned char *p = buf;
     size_t left = len;
     while (left > 0) {
-        ssize_t r = read(fd, p, left);
+        ssize_t r = recv(sock, p, left, 0);
         if (r < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -110,631 +68,198 @@ static ssize_t robust_read_all(int fd, void *buf, size_t len) {
     return (ssize_t)len;
 }
 
-/* Create PTY pair */
-int create_pty_pair(int *master, char *slave_name_buf, size_t slave_name_size) {
-    *master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
-    if (*master < 0) {
-        perror("open /dev/ptmx");
-        return -1;
-    }
-    if (set_cloexec(*master) < 0) {
-        log_msg("Warning: failed to FD_CLOEXEC pty master: %s\n", strerror(errno));
-    }
-    if (grantpt(*master) < 0 || unlockpt(*master) < 0) {
-        perror("pty setup (grantpt/unlockpt)");
-        close(*master);
-        return -1;
-    }
-    if (ptsname_r(*master, slave_name_buf, slave_name_size) < 0) {
-        perror("ptsname_r");
-        close(*master);
-        return -1;
-    }
-    int slave = open(slave_name_buf, O_RDWR | O_NOCTTY);
-    if (slave < 0) {
-        perror("open slave pty");
-        close(*master);
-        return -1;
-    }
-    struct termios t;
-    if (tcgetattr(slave, &t) < 0) {
-        perror("tcgetattr (slave)");
-        close(slave);
-        close(*master);
-        return -1;
-    }
-    cfmakeraw(&t);
-    if (tcsetattr(slave, TCSANOW, &t) < 0) {
-        perror("tcsetattr (slave)");
-        close(slave);
-        close(*master);
-        return -1;
-    }
-    close(slave);
-    return 0;
-}
-
-/* termios helpers */
-void save_termios(int fd, struct termios *t) {
-    if (tcgetattr(fd, t) < 0) {
-        perror("tcgetattr (save)");
-    }
-}
-void restore_termios(int fd, struct termios *t) {
-    if (tcsetattr(fd, TCSANOW, t) < 0) {
-        perror("tcsetattr (restore)");
-    }
-}
-
-void pause_low_priority_clients() {
-    log_msg("High priority client active. Pausing low priority clients.\n");
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (sp.clients[i].active && sp.clients[i].priority == PRIORITY_LOW) {
-            sp.clients[i].paused = 1;
-            log_msg("Paused low priority client PID %d\n", sp.clients[i].pid);
-        }
-    }
-}
-
-void resume_low_priority_clients() {
-    log_msg("Last high priority client disconnected. Resuming low priority clients.\n");
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (sp.clients[i].active && sp.clients[i].priority == PRIORITY_LOW) {
-            sp.clients[i].paused = 0;
-            log_msg("Resumed low priority client PID %d\n", sp.clients[i].pid);
-        }
-    }
-}
-
-/* client disconnect cleanup */
-void handle_client_disconnect(int client_idx) {
-    pthread_mutex_lock(&sp.lock);
-    Client *c = &sp.clients[client_idx];
-    if (!c->active) {
-        pthread_mutex_unlock(&sp.lock);
-        return;
-    }
-    log_msg("Client PID %d disconnected\n", c->pid);
-
-    /* The PTY master FD is owned by the relay thread and closed there.
-     * We just mark the client as inactive to signal the threads to exit. */
-    c->active = 0;
-    c->pid = -1;
-    c->paused = 0;
-    if (c->priority == PRIORITY_HIGH) {
-        sp.num_high_priority--;
-        if (sp.num_high_priority <= 0) {
-            sp.num_high_priority = 0; // ensure it's not negative
-            resume_low_priority_clients();
-        }
-    }
-    pthread_mutex_unlock(&sp.lock);
-}
-
-/* pty data relay thread */
-void* pty_relay_thread(void *arg) {
-    int client_idx = *(int*)arg;
-    free(arg);
-    Client *c = &sp.clients[client_idx];
-
-    unsigned char buf[BUF_SIZE];
-    fd_set readfds;
-
-    log_msg("Started relay thread for client %d (PID %d, PTY_FD %d)\n",
-            client_idx, c->pid, c->pty_master_fd);
-
-    int pty_fd = c->pty_master_fd;
-    if (pty_fd < 0) {
-        log_msg("Relay thread for client %d started with invalid pty_fd\n", client_idx);
-        handle_client_disconnect(client_idx);
-        return NULL;
-    }
-
-    while (running && c->active) {
-        pthread_mutex_lock(&sp.lock);
-        int paused = c->paused;
-        int real_fd = sp.real_fd;
-        pthread_mutex_unlock(&sp.lock);
-
-        FD_ZERO(&readfds);
-        FD_SET(real_fd, &readfds);
-        FD_SET(pty_fd, &readfds);
-        int max_fd = (real_fd > pty_fd ? real_fd : pty_fd);
-
-        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-        int ret = select(max_fd + 1, &readfds, NULL, NULL, &tv);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            perror("select (pty_relay)");
-            break;
-        }
-        if (ret == 0) continue;
-
-        if (FD_ISSET(real_fd, &readfds)) {
-            if (!paused) {
-                ssize_t n = read(real_fd, buf, sizeof(buf));
-                if (n > 0) {
-                    robust_write(pty_fd, buf, n);
-                } else if (n == 0) {
-                    log_msg("Real serial port hung up. Terminating relay for client %d.\n", c->pid);
-                    break;
-                }
-                else {
-                    log_msg("Real serial port error (read=%zd). Terminating relay for client %d.\n", n, c->pid);
-                    break;
-                }
-            }
-        }
-        if (FD_ISSET(pty_fd, &readfds)) {
-            ssize_t n = read(pty_fd, buf, sizeof(buf));
-            if (n > 0) {
-                if (!paused) {
-                    robust_write(real_fd, buf, n);
-                }
-            } else {
-                // PTY closed
-                break;
-            }
-        }
-    }
-
-    /* Close PTY master here, as we are the owner of this FD */
-    if (pty_fd >= 0) {
-        close(pty_fd);
-    }
-    pthread_mutex_lock(&sp.lock);
-    if (c->pty_master_fd == pty_fd) {
-        c->pty_master_fd = -1;
-    }
-    pthread_mutex_unlock(&sp.lock);
-
-    handle_client_disconnect(client_idx);
-    return NULL;
-}
-
-/* ---------- Binary control handling (SMIO protocol) ---------- */
-static void* handle_control_connection(void *arg) {
-    int ctrl_fd = *(int*)arg;
-    free(arg);
-
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(ctrl_fd, &readfds);
-
-    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-    int ret = select(ctrl_fd + 1, &readfds, NULL, NULL, &tv);
-    if (ret <= 0) {
-        close(ctrl_fd);
-        return NULL;
-    }
-
-    struct sm_header hdr;
-    if (robust_read_all(ctrl_fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
-        close(ctrl_fd);
-        return NULL;
-    }
-
-    if (memcmp(hdr.magic, SM_MAGIC, sizeof(SM_MAGIC)) != 0) {
-        log_msg("Invalid magic number\n");
-        close(ctrl_fd);
-        return NULL;
-    }
-
-    struct sm_response resp = {0};
-    void* payload = NULL;
-
-    if (hdr.payload_len > 0) {
-        payload = malloc(hdr.payload_len);
-        if (!payload) {
-            resp.rc = -1;
-            resp.errno_val = ENOMEM;
-            robust_write(ctrl_fd, &resp, sizeof(resp));
-            close(ctrl_fd);
-            return NULL;
-        }
-        if (robust_read_all(ctrl_fd, payload, hdr.payload_len) != (ssize_t)hdr.payload_len) {
-            free(payload);
-            close(ctrl_fd);
-            return NULL;
-        }
-    }
-
-    pthread_mutex_lock(&sp.lock);
-    int real_fd = sp.real_fd;
-    pthread_mutex_unlock(&sp.lock);
-
-    switch (hdr.type) {
-        case REQ_IOCTL: {
-            struct sm_ioctl_req *req = payload;
-            void *argp = NULL;
-            int value;
-            if (req->arg_type == ARG_BUFFER) {
-                argp = (void*)((char*)payload + sizeof(struct sm_ioctl_req));
-            } else if (req->arg_type == ARG_VALUE) {
-                memcpy(&value, (char*)payload + sizeof(struct sm_ioctl_req), sizeof(int));
-                argp = &value;
-            }
-
-            resp.rc = ioctl(real_fd, req->request, argp);
-            resp.errno_val = (resp.rc < 0) ? errno : 0;
-
-            if (resp.rc >= 0 && req->arg_type == ARG_BUFFER && (_IOC_DIR(req->request) & _IOC_READ)) {
-                resp.payload_len = req->arg_len;
-            }
-
-            if (req->request == TCSETS || req->request == TCSETSW || req->request == TCSETSF) {
-                save_termios(real_fd, &sp.current_settings);
-            }
-            break;
-        }
-        case REQ_TCFLSH:
-        case REQ_TCSENDBREAK: {
-            int arg = *(int*)payload;
-            if (hdr.type == REQ_TCFLSH) {
-                resp.rc = tcflush(real_fd, arg);
-            } else {
-                resp.rc = tcsendbreak(real_fd, arg);
-            }
-            resp.errno_val = (resp.rc < 0) ? errno : 0;
-            break;
-        }
-        case REQ_TCDRAIN:
-            resp.rc = tcdrain(real_fd);
-            resp.errno_val = (resp.rc < 0) ? errno : 0;
-            break;
-        default:
-            resp.rc = -1;
-            resp.errno_val = ENOSYS;
-            break;
-    }
-
-    robust_write(ctrl_fd, &resp, sizeof(resp));
-    if (resp.payload_len > 0) {
-        robust_write(ctrl_fd, (void*)((char*)payload + sizeof(struct sm_ioctl_req)), resp.payload_len);
-    }
-
-    if (payload) free(payload);
-    close(ctrl_fd);
-    return NULL;
-}
-
-
-/* control thread: accept either text commands (OPEN/CLOSE) or binary SMIO requests.
-   Uses MSG_PEEK to detect binary magic without consuming it.
-*/
-void* client_control_thread(void *arg) {
-    int client_fd = *(int*)arg;
-    free(arg);
-
-    // Not a binary magic: treat as text control (OPEN/CLOSE)
-    char buf[512];
-    ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) {
-        close(client_fd);
-        return NULL;
-    }
-    buf[n] = '\0';
-
-    if (strncmp(buf, "OPEN:", 5) == 0) {
-        // Format: OPEN:device:prio:pid
-        char *saveptr = NULL;
-        char *device = strtok_r(buf + 5, ":\n", &saveptr);
-        char *prio_s = strtok_r(NULL, ":\n", &saveptr);
-        char *pid_s = strtok_r(NULL, ":\n", &saveptr);
-        Priority prio = PRIORITY_LOW;
-        pid_t supplied_pid = -1;
-        if (prio_s) prio = (atoi(prio_s) == 1) ? PRIORITY_HIGH : PRIORITY_LOW;
-        if (pid_s) supplied_pid = (pid_t)atoi(pid_s);
-
-        pid_t peer_pid = supplied_pid;
-        if (!device || strcmp(device, sp.device) != 0) {
-            log_msg("Client PID %d requested wrong device '%s'\n", (int)peer_pid, device ? device : "(null)");
-            write(client_fd, "ERROR:Wrong device", strlen("ERROR:Wrong device") + 1);
-            close(client_fd);
-            return NULL;
-        }
-
-        pthread_mutex_lock(&sp.lock);
-        int idx = -1;
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (!sp.clients[i].active) { idx = i; break; }
-        }
-        if (idx == -1) {
-            log_msg("Max clients reached, rejecting PID %d\n", (int)peer_pid);
-            write(client_fd, "ERROR:Max clients", strlen("ERROR:Max clients") + 1);
-            pthread_mutex_unlock(&sp.lock);
-            close(client_fd);
-            return NULL;
-        }
-
-        char pty_slave_name[256];
-        int pty_master;
-        if (create_pty_pair(&pty_master, pty_slave_name, sizeof(pty_slave_name)) < 0) {
-            log_msg("Failed to create PTY for PID %d\n", (int)peer_pid);
-            write(client_fd, "ERROR:PTY creation failed", strlen("ERROR:PTY creation failed") + 1);
-            pthread_mutex_unlock(&sp.lock);
-            close(client_fd);
-            return NULL;
-        }
-
-        // send PTY slave path (NUL terminated)
-        write(client_fd, pty_slave_name, strlen(pty_slave_name) + 1);
-
-        // configure client slot
-        Client *c = &sp.clients[idx];
-        c->active = 1;
-        c->pid = peer_pid;
-        c->priority = prio;
-        c->pty_master_fd = pty_master;
-        c->paused = 0;
-
-        if (prio == PRIORITY_HIGH) {
-            sp.num_high_priority++;
-            pause_low_priority_clients();
-        } else {
-            if (sp.num_high_priority > 0) {
-                c->paused = 1;
-            }
-        }
-
-        // Apply current settings to the new PTY
-        restore_termios(c->pty_master_fd, &sp.current_settings);
-
-        pthread_mutex_unlock(&sp.lock);
-
-        // spawn threads for this client
-        pthread_t relay_tid;
-        int *pidx = malloc(sizeof(int));
-        if (!pidx) {
-            log_msg("malloc failed for pidx\n");
-            handle_client_disconnect(idx);
-            close(client_fd);
-            return NULL;
-        }
-        *pidx = idx;
-        if (pthread_create(&relay_tid, NULL, pty_relay_thread, pidx) != 0) {
-            log_msg("pthread_create relay failed\n");
-            handle_client_disconnect(idx);
-            close(c->pty_master_fd);
-            c->pty_master_fd = -1;
-            free(pidx);
-            close(client_fd);
-            return NULL;
-        }
-        pthread_detach(relay_tid);
-
-    } else if (strncmp(buf, "CLOSE:", 6) == 0) {
-        pid_t pid = (pid_t)atoi(buf + 6);
-        pthread_mutex_lock(&sp.lock);
-        int idx = -1;
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (sp.clients[i].active && sp.clients[i].pid == pid) { idx = i; break; }
-        }
-        pthread_mutex_unlock(&sp.lock);
-        if (idx != -1) {
-            log_msg("Received CLOSE from PID %d, initiating disconnect.\n", (int)pid);
-            handle_client_disconnect(idx);
-        } else {
-            log_msg("CLOSE: unknown pid %d\n", (int)pid);
-        }
-    } else {
-        // unknown text - ignore
-        log_msg("Unknown control message: %.*s\n", (int)n, buf);
-    }
-
-    close(client_fd);
-    return NULL;
-}
-
-/* Signal handler: write to pipe to wake select and set running=0 */
-void handle_signal(int sig) {
-    running = 0;
-    log_msg("Caught signal %d, shutting down.\n", sig);
-    if (sig_pipe_fds[1] != -1) {
-        const char c = 'x';
-        write(sig_pipe_fds[1], &c, 1);
-    }
-}
-
-/* main */
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s /dev/ttyUSB0\n", argv[0]);
-        exit(1);
-    }
-
-    signal(SIGPIPE, SIG_IGN);
-    struct sigaction sa;
-    sa.sa_handler = handle_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-
-    memset(&sp, 0, sizeof(sp));
-    pthread_mutex_init(&sp.lock, NULL);
-    sp.num_high_priority = 0;
-
-    sp.real_fd = open(argv[1], O_RDWR | O_NOCTTY);
-    if (sp.real_fd < 0) {
-        perror("open serial port");
-        exit(1);
-    }
-    if (set_cloexec(sp.real_fd) < 0) {
-        log_msg("Warning: failed to set FD_CLOEXEC on real fd: %s\n", strerror(errno));
-    }
-    strncpy(sp.device, argv[1], sizeof(sp.device) - 1);
-    save_termios(sp.real_fd, &sp.current_settings);
-    save_termios(sp.real_fd, &original_real_settings);
-
-    if (pipe(sig_pipe_fds) < 0) {
-        perror("pipe");
-        close(sp.real_fd);
-        exit(1);
-    }
-    set_cloexec(sig_pipe_fds[0]);
-    set_cloexec(sig_pipe_fds[1]);
-
-    unlink(DATA_SOCKET_PATH);
-    int data_socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (data_socket_fd < 0) {
-        perror("socket");
-        close(sp.real_fd);
-        exit(1);
-    }
-    set_cloexec(data_socket_fd);
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, DATA_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-
-    if (bind(data_socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(data_socket_fd);
-        close(sp.real_fd);
-        exit(1);
-    }
-    chmod(DATA_SOCKET_PATH, S_IRUSR | S_IWUSR);
-
-    if (listen(data_socket_fd, MAX_CLIENTS) < 0) {
-        perror("listen");
-        close(data_socket_fd);
-        close(sp.real_fd);
-        unlink(DATA_SOCKET_PATH);
-        exit(1);
-    }
-
-    unlink(CTRL_SOCKET_PATH);
-    int ctrl_socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (ctrl_socket_fd < 0) {
-        perror("socket");
-        close(sp.real_fd);
-        exit(1);
-    }
-    set_cloexec(ctrl_socket_fd);
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, CTRL_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-
-    if (bind(ctrl_socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(ctrl_socket_fd);
-        close(sp.real_fd);
-        exit(1);
-    }
-    chmod(CTRL_SOCKET_PATH, S_IRUSR | S_IWUSR);
-
-    if (listen(ctrl_socket_fd, MAX_CLIENTS) < 0) {
-        perror("listen");
-        close(ctrl_socket_fd);
-        close(sp.real_fd);
-        unlink(CTRL_SOCKET_PATH);
-        exit(1);
-    }
-
-    log_msg("Serial mux daemon started on %s\n", argv[1]);
-    log_msg("Listening on %s and %s\n", DATA_SOCKET_PATH, CTRL_SOCKET_PATH);
+void *ioctl_thread(void *arg) {
+    int sock = (int)(intptr_t)arg;
 
     while (running) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(data_socket_fd, &readfds);
-        FD_SET(ctrl_socket_fd, &readfds);
-        FD_SET(sig_pipe_fds[0], &readfds);
-        int maxfd = (data_socket_fd > ctrl_socket_fd ? data_socket_fd : ctrl_socket_fd);
-        maxfd = (maxfd > sig_pipe_fds[0] ? maxfd : sig_pipe_fds[0]);
+        uint32_t magic_n, reqid_n, arg_len_n;
+        uint64_t ioc_be;
+        if (recv_all(sock, &magic_n, 4) != 4) break;
+        if (ntohl(magic_n) != MAGIC) break;
+        if (recv_all(sock, &reqid_n, 4) != 4) break;
+        if (recv_all(sock, &ioc_be, 8) != 8) break;
+        if (recv_all(sock, &arg_len_n, 4) != 4) break;
 
-        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-        int ret = select(maxfd + 1, &readfds, NULL, NULL, &tv);
-        if (ret < 0) {
+        uint32_t arg_len = ntohl(arg_len_n);
+        unsigned long request = (unsigned long)be64toh(ioc_be);
+
+        char arg_buf[4096];
+        void *argp = NULL;
+        if (arg_len > 0) {
+            if (arg_len > sizeof(arg_buf)) {
+                fprintf(stderr, "DAEMON: ioctl arg too big %u\n", arg_len);
+                break;
+            }
+            if (recv_all(sock, arg_buf, arg_len) != (ssize_t)arg_len) break;
+            argp = arg_buf;
+        }
+
+        int ret = ioctl(pty_fd, request, argp);
+        int err = errno;
+
+        uint32_t resp_outlen = 0;
+        if (ret == 0 && (_IOC_DIR(request) & _IOC_READ)) {
+            resp_outlen = ioctl_arg_size(request);
+        }
+
+        int32_t net_ret = htonl(ret);
+        int32_t net_errno = htonl(err);
+        uint32_t net_resp_outlen = htonl(resp_outlen);
+
+        if (send_all(sock, &reqid_n, 4) < 0) break;
+        if (send_all(sock, &net_ret, 4) < 0) break;
+        if (send_all(sock, &net_errno, 4) < 0) break;
+        if (send_all(sock, &net_resp_outlen, 4) < 0) break;
+        if (resp_outlen > 0) {
+            if (send_all(sock, argp, resp_outlen) < 0) break;
+        }
+    }
+
+    close(sock);
+    return NULL;
+}
+
+void *accept_thread(void *arg) {
+    int sock = (int)(intptr_t)arg;
+    while(running) {
+        int client_fd = accept(sock, NULL, NULL);
+        if (client_fd < 0) {
             if (errno == EINTR) continue;
-            perror("select (main)");
+            perror("accept(ctrl_sock)");
             break;
         }
-        if (ret == 0) continue;
+        pthread_t tid;
+        pthread_create(&tid, NULL, ioctl_thread, (void*)(intptr_t)client_fd);
+        pthread_detach(tid);
+    }
+    return NULL;
+}
 
-        if (FD_ISSET(sig_pipe_fds[0], &readfds)) {
-            char drain[64];
-            while (read(sig_pipe_fds[0], drain, sizeof(drain)) > 0) {}
-            if (!running) break;
-        }
+int create_unix_socket(const char *path) {
+    struct sockaddr_un addr;
+    int fd;
 
-        if (FD_ISSET(data_socket_fd, &readfds)) {
-            int client_fd = accept(data_socket_fd, NULL, NULL);
-            if (client_fd < 0) {
-                if (errno == EINTR) continue;
-                perror("accept");
-                continue;
-            }
-            set_cloexec(client_fd);
+    if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+        perror("socket error");
+        return -1;
+    }
 
-            // spawn control thread
-            pthread_t tid;
-            int *pfd = malloc(sizeof(int));
-            if (!pfd) {
-                log_msg("malloc failed for control thread arg\n");
-                close(client_fd);
-                continue;
-            }
-            *pfd = client_fd;
-            if (pthread_create(&tid, NULL, client_control_thread, pfd) != 0) {
-                log_msg("pthread_create failed for control thread\n");
-                free(pfd);
-                close(client_fd);
-                continue;
-            }
-            pthread_detach(tid);
-        }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path)-1);
+    unlink(path);
 
-        if (FD_ISSET(ctrl_socket_fd, &readfds)) {
-             int client_fd = accept(ctrl_socket_fd, NULL, NULL);
-            if (client_fd < 0) {
-                if (errno == EINTR) continue;
-                perror("accept");
-                continue;
-            }
-            set_cloexec(client_fd);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        perror("bind error");
+        close(fd);
+        return -1;
+    }
 
-            pthread_t tid;
-            int *pfd = malloc(sizeof(int));
-             if (!pfd) {
-                log_msg("malloc failed for control thread arg\n");
-                close(client_fd);
-                continue;
+    if (listen(fd, 5) == -1) {
+        perror("listen error");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int main(void) {
+    char *device = getenv(DAEMON_DEVICE_ENV);
+    if (!device) {
+        fprintf(stderr, "DAEMON: %s not set\n", DAEMON_DEVICE_ENV);
+        return 1;
+    }
+
+    pty_fd = open(device, O_RDWR | O_NOCTTY);
+    if (pty_fd < 0) {
+        perror("DAEMON: Failed to open pty device");
+        return 1;
+    }
+
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    int data_sock = create_unix_socket(DATA_SOCKET_PATH);
+    if (data_sock < 0) return 1;
+    int ctrl_sock = create_unix_socket(CTRL_SOCKET_PATH);
+    if (ctrl_sock < 0) { close(data_sock); return 1; }
+
+    pthread_t ioctl_tid;
+
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        perror("epoll_create1");
+        return 1;
+    }
+
+    struct epoll_event ev, events[MAX_EPOLL_EVENTS];
+    ev.events = EPOLLIN;
+    ev.data.fd = data_sock;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, data_sock, &ev) < 0) {
+        perror("epoll_ctl: data_sock");
+        return 1;
+    }
+
+    ev.data.fd = pty_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, pty_fd, &ev) < 0) {
+        perror("epoll_ctl: pty_fd");
+        return 1;
+    }
+
+    int client_fds[MAX_CLIENTS] = {0};
+    int num_clients = 0;
+
+    // Control connection handling
+    pthread_create(&ioctl_tid, NULL, accept_thread, (void*)(intptr_t)ctrl_sock);
+
+    char buf[4096];
+    while(running) {
+        int n = epoll_wait(epoll_fd, events, MAX_EPOLL_EVENTS, 100);
+        for (int i=0; i<n; ++i) {
+            if (events[i].data.fd == data_sock) { // New client
+                int client_fd = accept(data_sock, NULL, NULL);
+                if (client_fd >= 0 && num_clients < MAX_CLIENTS) {
+                    ev.events = EPOLLIN;
+                    ev.data.fd = client_fd;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
+                    client_fds[num_clients++] = client_fd;
+                } else if (client_fd >= 0) {
+                    close(client_fd);
+                }
+            } else if (events[i].data.fd == pty_fd) { // Data from PTY
+                ssize_t bytes = read(pty_fd, buf, sizeof(buf));
+                if (bytes > 0) {
+                    for(int j=0; j<num_clients; ++j) {
+                        send_all(client_fds[j], buf, bytes);
+                    }
+                }
+            } else { // Data from a client
+                int client_fd = events[i].data.fd;
+                ssize_t bytes = read(client_fd, buf, sizeof(buf));
+                if (bytes <= 0) {
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
+                    close(client_fd);
+                    for(int j=0; j<num_clients; ++j) {
+                        if (client_fds[j] == client_fd) {
+                            client_fds[j] = client_fds[num_clients-1];
+                            num_clients--;
+                            break;
+                        }
+                    }
+                } else {
+                    send_all(pty_fd, buf, bytes);
+                }
             }
-            *pfd = client_fd;
-            if (pthread_create(&tid, NULL, handle_control_connection, pfd) != 0) {
-                log_msg("pthread_create failed for control thread\n");
-                free(pfd);
-                close(client_fd);
-                continue;
-            }
-            pthread_detach(tid);
         }
     }
 
-    log_msg("Shutting down: restoring original termios\n");
-    restore_termios(sp.real_fd, &original_real_settings);
-
-    pthread_mutex_lock(&sp.lock);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (sp.clients[i].active && sp.clients[i].pty_master_fd >= 0) {
-            close(sp.clients[i].pty_master_fd);
-            sp.clients[i].pty_master_fd = -1;
-        }
-    }
-    pthread_mutex_unlock(&sp.lock);
-
-    close(sp.real_fd);
-    close(data_socket_fd);
-    close(ctrl_socket_fd);
+    for(int i=0; i<num_clients; ++i) close(client_fds[i]);
+    close(epoll_fd);
+    close(data_sock);
+    close(ctrl_sock);
+    close(pty_fd);
     unlink(DATA_SOCKET_PATH);
     unlink(CTRL_SOCKET_PATH);
-    if (sig_pipe_fds[0] >= 0) close(sig_pipe_fds[0]);
-    if (sig_pipe_fds[1] >= 0) close(sig_pipe_fds[1]);
 
-    log_msg("Daemon shut down\n");
     return 0;
 }

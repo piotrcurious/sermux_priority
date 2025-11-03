@@ -1,39 +1,62 @@
 #ifndef SERIALMUX_H
 #define SERIALMUX_H
 
-#include <stdint.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 
-static const char SM_MAGIC[4] = {'S', 'M', 'I', 'O'};
+// These definitions are copied from <asm/termbits.h> to avoid header conflicts
+#ifndef _UAPI_ASM_GENERIC_TERMBITS_H
+#define _UAPI_ASM_GENERIC_TERMBITS_H
 
-enum {
-    REQ_IOCTL = 1,
-    REQ_TCFLSH = 2,
-    REQ_TCSENDBREAK = 3,
-    REQ_TCDRAIN = 4
+#ifdef NCCS
+#undef NCCS
+#endif
+#define NCCS 19
+
+struct termios2 {
+	tcflag_t c_iflag;	/* input mode flags */
+	tcflag_t c_oflag;	/* output mode flags */
+	tcflag_t c_cflag;	/* control mode flags */
+	tcflag_t c_lflag;	/* local mode flags */
+	cc_t	 c_line;	/* line discipline */
+	cc_t	 c_cc[NCCS];	/* control characters */
+	speed_t	 c_ispeed;	/* input speed */
+	speed_t	 c_ospeed;	/* output speed */
 };
+#define TCGETS2		_IOR('T', 0x2A, struct termios2)
+#define TCSETS2		_IOW('T', 0x2B, struct termios2)
+#define TCSETSW2	_IOW('T', 0x2C, struct termios2)
+#define TCSETSF2	_IOW('T', 0x2D, struct termios2)
+#endif
 
-enum {
-    ARG_NONE = 0,
-    ARG_VALUE = 1,
-    ARG_BUFFER = 2
-};
 
-struct sm_header {
-    char magic[4];
-    uint32_t type;
-    uint32_t payload_len;
-};
-
-struct sm_ioctl_req {
-    uint64_t request;
-    uint32_t arg_type;
-    uint32_t arg_len;
-};
-
-struct sm_response {
-    int32_t rc;
-    int32_t errno_val;
-    uint32_t payload_len;
-};
+// A best-effort determination of ioctl argument size based on the request number
+static inline size_t ioctl_arg_size(unsigned long request) {
+    switch (request) {
+        // termios
+        case TCGETS:
+        case TCSETS:
+        case TCSETSW:
+        case TCSETSF:
+            return sizeof(struct termios);
+        // termios2
+        case TCGETS2:
+        case TCSETS2:
+        case TCSETSW2:
+        case TCSETSF2:
+            return sizeof(struct termios2);
+        // Modem control
+        case TIOCMGET:
+        case TIOCMSET:
+        case TIOCMBIS:
+        case TIOCMBIC:
+            return sizeof(int);
+        // FIONREAD
+        case FIONREAD:
+            return sizeof(int);
+        default:
+            return 0;
+    }
+}
 
 #endif // SERIALMUX_H
